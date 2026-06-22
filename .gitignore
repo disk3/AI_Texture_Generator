@@ -1,0 +1,26 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ComfyUI portable installation (downloaded at runtime)
+comfyui_portable/
+
+# Generated assets (test outputs)
+assets/*.png
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Distribution artifacts
+*.zip
+*.7z
+*.tar.gz

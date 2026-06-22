@@ -1,0 +1,39 @@
+AI Texture to Generator — 开源非商业用途许可
+
+Copyright (c) 2026 Xiong Meng Han
+
+本软件按"原样"提供，作者不提供任何形式的明示或默示保证，包括但不限于适
+销性、特定用途适用性及非侵权的保证。
+
+---
+
+允许的行为（无需额外授权）：
+
+- 个人、学术、教育、研究及非营利组织以非商业目的使用、复制、修改和分发
+  本软件。
+- 将本软件的修改版本或衍生作品按本许可相同条款进行分发。
+
+禁止的行为（除非获得作者明确的书面授权）：
+
+- 将本软件整体或部分用于商业产品或商业服务中，无论直接或间接盈利。
+- 向任何第三方出授权、销售、出租、转让或再许可本软件以获取商业利益。
+
+商业用途的定义（包括但不限于）：
+
+- 在商业公司内部使用本软件产出资产以用于商业项目。
+- 将本软件集成到任何付费或订阅制的产品/服务中。
+- 使用本软件为客户提供付费服务。
+
+如需商业授权，请联系作者。
+
+---
+
+第三方软件声明：
+
+本插件集成或引用了以下第三方软件与模型，各自有其独立的许可条款。
+使用者应自行遵守相关第三方许可：
+
+- ComfyUI (GPLv3)         — https://github.com/comfyanonymous/ComfyUI
+- CHORD (Ubisoft La Forge) — https://github.com/ubisoft/ComfyUI-Chord
+- Z-Image Turbo            — https://modelscope.cn/models/Tongyi-MAI/ZImage-Turbo
+- SeedVR2                  — https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler

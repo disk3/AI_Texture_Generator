@@ -1,0 +1,52 @@
+from .comfyui_client import ComfyUIClient
+from .gpt_image_client import GPTImageClient
+from .nanobanana_client import NanobananaClient
+from ..utils.logger import get_logger
+
+log = get_logger(__name__)
+
+
+class ConnectionPool:
+    def __init__(self):
+        self._clients = {}
+
+    def get_client(self, backend_type: str, url: str, **kwargs):
+        key = f"{backend_type}@{url}"
+        # API 客户端的 base_url 决定实际连接目标，必须纳入 key
+        if backend_type in ('GPT_IMAGE', 'NANOBANANA'):
+            base_url = kwargs.get("base_url", "")
+            if base_url:
+                key += f"@{base_url}"
+            model = kwargs.get("model", "")
+            if model:
+                key += f"#{model}"
+            api_key = kwargs.get("api_key", "")
+            if api_key:
+                key += f"@key:{abs(hash(api_key))}"
+
+        if key not in self._clients:
+            if backend_type == 'COMFYUI':
+                self._clients[key] = ComfyUIClient(base_url=url, **kwargs)
+            elif backend_type == 'GPT_IMAGE':
+                self._clients[key] = GPTImageClient(
+                    api_key=kwargs.get("api_key", ""),
+                    model=kwargs.get("model", "gpt-image-2"),
+                    base_url=kwargs.get("base_url", ""),
+                )
+            elif backend_type == 'NANOBANANA':
+                self._clients[key] = NanobananaClient(
+                    api_key=kwargs.get("api_key", ""),
+                    base_url=kwargs.get("base_url", "https://generativelanguage.googleapis.com/v1beta"),
+                    model=kwargs.get("model", "gemini-2.5-flash-image"),
+                )
+            else:
+                raise ValueError(f"Unknown backend type: {backend_type}")
+        return self._clients[key]
+
+    def check_health(self, backend_type: str, url: str, **kwargs) -> bool:
+        try:
+            client = self.get_client(backend_type, url, **kwargs)
+            return client.check_health()
+        except Exception:
+            log.debug("Health check failed for %s @ %s", backend_type, url)
+            return False
