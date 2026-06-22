@@ -40,6 +40,7 @@ class GenerationConfig:
     denoising_strength: float = 0.75
     reference_tile_strength: float = 0.5
     use_chord_enhanced: bool = True
+    fast_mode: bool = False
 
 
 @dataclass

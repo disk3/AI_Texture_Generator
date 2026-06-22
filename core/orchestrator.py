@@ -131,6 +131,7 @@ class GenerationOrchestrator:
             batch_size=props.batch_size,
             reference_tile_strength=getattr(props, "reference_tile_strength", 0.5),
             use_chord_enhanced=True,
+            fast_mode=getattr(props, "fast_mode", False),
         )
 
         # 参考图处理
@@ -222,6 +223,7 @@ class GenerationOrchestrator:
             "output_roughness": props.output_roughness,
             "output_metalness": props.output_metalness,
             "output_height": props.output_height,
+            "fast_mode": getattr(props, "fast_mode", False),
         }
 
         self._thread = threading.Thread(
@@ -629,6 +631,20 @@ class GenerationOrchestrator:
                 filtered_textures['diffuse'] = textures['diffuse']
 
             textures = filtered_textures
+
+            # 快速模式：用算法做无缝平铺，替代 Flux-Fill AI 修缝
+            # 保证所有显卡都能拿到无缝贴图（游戏贴图硬需求）
+            if data.get("fast_mode", False):
+                for k in textures:
+                    textures[k] = self._make_seamless_tile(textures[k])
+
+            # 将贴图缩放到用户选择的输出尺寸
+            # 快速模式生成于 1024²，高质量模式生成于 2048²，用户可能选了 512/1024/2048/4096
+            target_w = int(data["config"].width)
+            target_h = int(data["config"].height)
+            for k in textures:
+                if textures[k].size != (target_w, target_h):
+                    textures[k] = textures[k].resize((target_w, target_h), Image.LANCZOS)
 
             output_dir = data.get("asset_output_path", "")
             images = {}

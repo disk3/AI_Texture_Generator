@@ -5,8 +5,8 @@ bl_info = {
     "blender": (3, 6, 0),
     "location": "3D 视图 > 侧边栏 (N) > AI 材质",
     "description": "从提示词或参考图一键生成 PBR 材质贴图（支持本地 ComfyUI 与在线 API）",
-    "doc_url": "https://github.com/xiongmenghan/BlenderAIGC",
-    "tracker_url": "https://github.com/xiongmenghan/BlenderAIGC/issues",
+    "doc_url": "https://github.com/disk3/AI_Texture_Generator",
+    "tracker_url": "https://github.com/disk3/AI_Texture_Generator/issues",
     "category": "3D View",
     "support": "COMMUNITY",
 }

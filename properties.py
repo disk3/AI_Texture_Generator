@@ -518,6 +518,14 @@ class CTProperties(bpy.types.PropertyGroup):
     )
     batch_size: bpy.props.IntProperty(name="批量数量", default=1, min=1, max=4)
 
+    # 快速模式：跳过 SeedVR2 超分 + Flux-Fill 修缝，Z-Image 1024² 直接送 CHORD
+    # 可大幅降低显存占用和生成时间。最终输出始终按用户选择的尺寸缩放。
+    fast_mode: bpy.props.BoolProperty(
+        name="快速模式",
+        description="开启：省显存、速度快，适合低显存卡和日常出图。关闭：质量更高但需要更高显存",
+        default=False,
+    )
+
     # -------------------------------------------------------------------------
     # TEXTURE 模式 — 工业材质配置
     # -------------------------------------------------------------------------

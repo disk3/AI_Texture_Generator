@@ -161,6 +161,7 @@ class AI_PT_TexturePanel(bpy.types.Panel):
         row.prop(props, "height", text="高")
         row = box.row(align=True)
         row.prop(props, "seed", text="种子")
+        row.prop(props, "fast_mode", text="快速模式")
 
         # Maps
         box = layout.box()

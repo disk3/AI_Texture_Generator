@@ -81,12 +81,31 @@ class ComfyUIClient(AbstractSDClient):
         log.debug("Node 4 prompt length: %d", len(node4_text))
         log.debug("Node 4 prompt preview: %s", node4_text[:300])
 
-        # 覆盖 CHORD ResizeAndPadImage 节点尺寸（Node 11）
+        # CHORD ResizeAndPadImage 尺寸（Node 11）
+        # 快速模式：输入来自 Node 21（Z-Image 1024² → ImageScale 1024²），CHORD 跑 1024²
+        # 高质量模式：输入来自 SeedVR2（2048²），CHORD 跑 2048²
         if "11" in workflow:
-            workflow["11"]["inputs"]["target_width"] = config.width
-            workflow["11"]["inputs"]["target_height"] = config.height
+            if getattr(config, "fast_mode", False):
+                workflow["11"]["inputs"]["target_width"] = 1024
+                workflow["11"]["inputs"]["target_height"] = 1024
+            else:
+                workflow["11"]["inputs"]["target_width"] = 2048
+                workflow["11"]["inputs"]["target_height"] = 2048
 
-        # 始终使用完整 ZImage + CHORD 工作流
+        # 快速模式：跳过 SeedVR2 + Flux-Fill 整条重链，直接把 Z-Image 1024²
+        # 输出接入 CHORD，节省大量显存和计算。适合低显存卡或追求速度。
+        if getattr(config, "fast_mode", False):
+            # 改接 CHORD 输入
+            if "11" in workflow:
+                workflow["11"]["inputs"]["image"] = ["21", 0]
+            # 移除不需要的节点，防止 ComfyUI 仍加载它们
+            _skip = {
+                "34","35","36","39","40","41","43","44","45","46","47",
+                "51","58","59","60","61","62","63","65","66","67","71",
+                "72","73","74","75","77",
+            }
+            for nid in _skip:
+                workflow.pop(nid, None)
 
         # img2img: 注入 LoadImage + VAEEncode，把参考图编码后接入 KSampler
         if config.init_image is not None:
@@ -162,7 +181,9 @@ class ComfyUIClient(AbstractSDClient):
         seed = config.seed if config.seed >= 0 else random.randint(0, 2147483647)
         return {
             "4": {"text": config.prompt},
-            "6": {"width": config.width, "height": config.height},
+            # Z-Image Turbo 固定 1024² 生成（最佳精度/显存平衡点）
+            # 最终输出尺寸由 _import_texture_results 做 resize
+            "6": {"width": 1024, "height": 1024},
             "7": {"seed": seed},
         }
 

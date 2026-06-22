@@ -376,7 +376,7 @@
         2
       ],
       "seed": 195133649986045,
-      "steps": 15,
+      "steps": 8,
       "cfg": 1,
       "sampler_name": "er_sde",
       "scheduler": "simple",
@@ -544,7 +544,7 @@
     "inputs": {
       "model": "seedvr2_ema_3b_fp16.safetensors",
       "device": "cuda:0",
-      "blocks_to_swap": 32,
+      "blocks_to_swap": 0,
       "swap_io_components": true,
       "offload_device": "cpu",
       "attention_mode": "sdpa"
@@ -584,7 +584,7 @@
   "1": {
     "inputs": {
       "unet_name": "z_image_turbo_bf16.safetensors",
-      "weight_dtype": "default"
+      "weight_dtype": "fp8_e4m3fn"
     },
     "class_type": "UNETLoader"
   },
