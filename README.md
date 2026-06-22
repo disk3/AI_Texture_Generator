@@ -1,0 +1,2 @@
+# AI_Texture_Generator
+从提示词或参考图一键生成PBR材质贴图(支持本地ComfyUI与在线API)
