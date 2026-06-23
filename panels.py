@@ -34,7 +34,7 @@ def _provider_status(prefs, provider):
             return "请在偏好设置中填写 ComfyUI 地址", 'ERROR'
         install_path = prefs.comfyui_path or comfyui_installer.get_default_install_path()
         if not comfyui_installer.is_comfyui_installed(install_path):
-            return "ComfyUI 未安装，请点击下方安装", 'ERROR'
+            return "ComfyUI 未安装，请在偏好设置中安装", 'ERROR'
         if prefs.comfyui_path:
             return "ComfyUI 已配置，自动启动已启用", 'CHECKMARK'
         return "ComfyUI 已安装，自动启动已启用", 'CHECKMARK'
@@ -65,6 +65,11 @@ def _draw_api_model_selector(box, props, prefs, provider):
         box.label(text=f"默认: {api_provider.default_image_model}", icon='INFO')
 
 
+def _is_local_comfyui_ready(prefs) -> bool:
+    install_path = prefs.comfyui_path or comfyui_installer.get_default_install_path()
+    return comfyui_installer.is_comfyui_installed(install_path)
+
+
 def _draw_generation_backend(box, props, prefs):
     provider = props.texture_generator
     row = box.row(align=True)
@@ -75,13 +80,7 @@ def _draw_generation_backend(box, props, prefs):
     status_text, status_icon = _provider_status(prefs, provider)
     box.label(text=status_text, icon=status_icon)
 
-    if provider == 'LOCAL_COMFYUI':
-        if os.name == "nt":
-            install_path = prefs.comfyui_path or comfyui_installer.get_default_install_path()
-            if not comfyui_installer.is_comfyui_installed(install_path):
-                row = box.row()
-                row.operator("ai_concept.install_comfyui", text="安装 ComfyUI", icon='IMPORT')
-    elif preferences.is_api_provider_value(provider):
+    if preferences.is_api_provider_value(provider):
         _draw_api_model_selector(box, props, prefs, provider)
 
 
@@ -129,7 +128,8 @@ class AI_PT_TexturePanel(bpy.types.Panel):
             row.operator("ai_concept.caption_reference_image", text="反推提示词", icon='VIEWZOOM')
             row.operator("ai_concept.clear_reference_image", text="", icon='X')
             _prop_row(box, props, "reference_denoise", "重绘幅度")
-            _prop_row(box, props, "reference_tile_strength", "纹理保持")
+            if props.texture_generator == 'LOCAL_COMFYUI' and _is_local_comfyui_ready(prefs):
+                _prop_row(box, props, "reference_tile_strength", "纹理保持")
         else:
             box.separator(factor=4.0)
             col = box.column(align=True)
@@ -159,9 +159,13 @@ class AI_PT_TexturePanel(bpy.types.Panel):
         row = box.row(align=True)
         row.prop(props, "width", text="宽")
         row.prop(props, "height", text="高")
-        row = box.row(align=True)
-        row.prop(props, "seed", text="种子")
-        row.prop(props, "fast_mode", text="快速模式")
+        install_path = prefs.comfyui_path or comfyui_installer.get_default_install_path()
+        if comfyui_installer.is_comfyui_installed(install_path):
+            row = box.row(align=True)
+            row.prop(props, "seed", text="种子")
+            row.prop(props, "fast_mode", text="快速模式")
+            row = box.row(align=True)
+            row.prop(props, "use_local_pbr", text="不用 ComfyUI，本地生成 PBR")
 
         # Maps
         box = layout.box()
@@ -218,6 +222,8 @@ class AI_PT_TexturePanel(bpy.types.Panel):
                 row.prop(item, "is_expanded", text="", icon=icon_expand, emboss=False)
                 row.label(text=f"{idx+1}. {item.name}")
                 row.label(text=item.timestamp)
+                op = row.operator("ai_concept.remove_result", text="", icon='X')
+                op.index = idx
 
                 if not item.is_expanded:
                     continue

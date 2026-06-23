@@ -526,6 +526,13 @@ class CTProperties(bpy.types.PropertyGroup):
         default=False,
     )
 
+    # 本地 PBR 提取：不依赖 ComfyUI/CHORD，用 CPU 算法生成法线与无缝贴图
+    use_local_pbr: bpy.props.BoolProperty(
+        name="不用 ComfyUI，本地生成 PBR",
+        description="勾选后法线、无缝等处理全部在 Blender 内完成，不需要 ComfyUI/CHORD",
+        default=False,
+    )
+
     # -------------------------------------------------------------------------
     # TEXTURE 模式 — 工业材质配置
     # -------------------------------------------------------------------------

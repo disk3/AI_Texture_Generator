@@ -131,9 +131,17 @@ def _api_provider_enum_items(context):
 
 
 def get_texture_provider_items(self, context):
-    return [
-        ('LOCAL_COMFYUI', "Local ComfyUI", "Use local ZImage+CHORD workflow"),
-    ] + _api_provider_enum_items(context)
+    items = []
+    # 仅在检测到本地 ComfyUI 已安装时才在面板中显示该后端
+    try:
+        addon_pkg = __package__.split('.')[0]
+        prefs = context.preferences.addons[addon_pkg].preferences
+        install_path = prefs.comfyui_path or comfyui_installer.get_default_install_path()
+        if comfyui_installer.is_comfyui_installed(install_path):
+            items.append(('LOCAL_COMFYUI', "Local ComfyUI", "Use local ZImage+CHORD workflow"))
+    except Exception:
+        pass
+    return items + _api_provider_enum_items(context)
 
 
 def _selected_api_provider_from_props(props, context):
@@ -732,19 +740,19 @@ class CTAddonPreferences(bpy.types.AddonPreferences):
             row = box.row()
             row.operator("ai_concept.install_comfyui", text="自动下载安装", icon='IMPORT')
 
-        row = box.row(align=True)
-        op = row.operator("ai_concept.test_provider_connection", text="测试", icon='CHECKMARK')
-        op.provider = 'COMFYUI'
-        box.prop(self, "comfyui_controlnet_tile_model")
+        # 仅安装完成且指定了路径时才显示测试与 ControlNet Tile 配置
+        if installed and self.comfyui_path:
+            row = box.row(align=True)
+            op = row.operator("ai_concept.test_provider_connection", text="测试", icon='CHECKMARK')
+            op.provider = 'COMFYUI'
+            box.prop(self, "comfyui_controlnet_tile_model")
 
-        # Model Manager
-        model_box = layout.box()
-        model_box.label(text="模型管理", icon='PACKAGE')
-        model_box.prop(self, "use_china_mirror")
-        model_box.prop(self, "huggingface_token")
-        if not installed:
-            model_box.label(text="请先安装 ComfyUI 再下载模型", icon='ERROR')
-        else:
+        # Model Manager：仅在 ComfyUI 安装完成后显示
+        if installed:
+            model_box = layout.box()
+            model_box.label(text="模型管理", icon='PACKAGE')
+            model_box.prop(self, "use_china_mirror")
+            model_box.prop(self, "huggingface_token")
             model_box.label(text="公开模型可直接下载；gated 模型需填 HuggingFace Token 或手动下载")
             for model in comfyui_installer.get_model_registry():
                 actual_path = comfyui_installer.find_model_file(install_path, model)

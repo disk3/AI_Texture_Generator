@@ -14,6 +14,7 @@ from ..ui import preview_manager
 from ..material.uv_extractor import UVExtractor
 from ..material.shader_builder import ShaderBuilder
 from ..material.pbr_processor import generate_normal_map, generate_roughness_map, generate_metallic_map
+from ..material.local_pbr_processor import generate_normal_from_diffuse, generate_height_from_normal, make_seamless_tile_iem
 from ..properties import _build_preservation_prompt
 from ..preferences import get_selected_api_provider_snapshot, resolve_asset_output_path
 from ..sd_backend import comfyui_installer
@@ -226,6 +227,9 @@ class GenerationOrchestrator:
             "fast_mode": getattr(props, "fast_mode", False),
         }
 
+        # 将用户本地 PBR 开关传递给后台线程
+        data["use_local_pbr"] = getattr(props, "use_local_pbr", False)
+
         self._thread = threading.Thread(
             target=self._generate_worker,
             args=(data,),
@@ -307,25 +311,8 @@ class GenerationOrchestrator:
 
     @staticmethod
     def _make_seamless_tile(image: Image.Image) -> Image.Image:
-        """用 offset + 羽化 mask 把图片处理成可平铺的无缝贴图。"""
-        img = image.convert("RGB")
-        w, h = img.size
-        if w <= 0 or h <= 0:
-            return img
-
-        # 50% 平移，让接缝移到中心
-        offset = ImageChops.offset(img, w // 2, h // 2)
-
-        # 中心羽化 mask：中心 255，边缘 0，过渡区用高斯模糊
-        mask = Image.new("L", (w, h), 0)
-        draw = ImageDraw.Draw(mask)
-        feather = max(min(w, h) // 8, 8)
-        draw.rectangle([feather, feather, w - feather, h - feather], fill=255)
-        mask = mask.filter(ImageFilter.GaussianBlur(radius=feather // 2))
-
-        # 在原始图和 offset 图之间按 mask 融合
-        blended = Image.composite(img, offset, mask)
-        return blended
+        """用本地算法把图片处理成可平铺的无缝贴图。"""
+        return make_seamless_tile_iem(image, method="BASIC", blend_ratio=0.125)
 
     def _process_reference(self, data, use_chord: bool = True):
         """有参考图且 prompt 为空时：直接处理参考图为无缝 diffuse，再提取 PBR。
@@ -351,8 +338,27 @@ class GenerationOrchestrator:
 
         self._extract_pbr(diffuse, data, use_chord=use_chord)
 
+    @staticmethod
+    def _is_comfyui_installed_for_data(data: dict) -> bool:
+        """根据 data 中的 comfyui_path 判断本地 ComfyUI 是否已安装。"""
+        path = data.get("comfyui_path", "") or comfyui_installer.get_default_install_path()
+        return comfyui_installer.is_comfyui_installed(path)
+
+    def _should_use_chord(self, data: dict, requested_use_chord: bool) -> bool:
+        """决定是否真正调用 CHORD。
+
+        以下情况跳过 CHORD：
+        1. 用户手动开启"不用 ComfyUI，本地生成 PBR"；
+        2. 本地 ComfyUI 未安装（修复 API 路径仍尝试 CHORD 的问题）。
+        """
+        if data.get("use_local_pbr", False):
+            return False
+        if not self._is_comfyui_installed_for_data(data):
+            return False
+        return requested_use_chord
+
     def _extract_pbr(self, diffuse: Image.Image, data, use_chord: bool = True):
-        """从 diffuse 提取 PBR：默认始终使用 CHORD，CHORD 失败时算法提取。"""
+        """从 diffuse 提取 PBR：优先使用 CHORD，不可用时使用本地算法 fallback。"""
         target_w = data["config"].width
         target_h = data["config"].height
         if diffuse.size != (target_w, target_h):
@@ -360,7 +366,9 @@ class GenerationOrchestrator:
 
         textures = {'diffuse': diffuse}
 
-        if use_chord:
+        effective_use_chord = self._should_use_chord(data, use_chord)
+
+        if effective_use_chord:
             chord_success = False
             try:
                 comfyui_path = data.get("comfyui_path", "") or comfyui_installer.get_default_install_path()
@@ -407,8 +415,14 @@ class GenerationOrchestrator:
                 thread_safe_callback({
                     "status": "progress",
                     "progress": 0.4,
-                    "message": "CHORD 失败，回退到算法提取...",
+                    "message": "CHORD 失败，回退到本地算法提取...",
                 })
+        else:
+            thread_safe_callback({
+                "status": "progress",
+                "progress": 0.4,
+                "message": "ComfyUI 未安装或已启用本地 PBR，使用本地算法提取...",
+            })
 
         # 算法填充未提取到的贴图
         if 'normal' not in textures:
@@ -417,7 +431,10 @@ class GenerationOrchestrator:
                 "progress": 0.55,
                 "message": "正在提取法线贴图...",
             })
-            textures['normal'] = generate_normal_map(diffuse, strength=0.8)
+            if data.get("use_local_pbr", False) or not self._is_comfyui_installed_for_data(data):
+                textures['normal'] = generate_normal_from_diffuse(diffuse, strength=2.0, detail=0.5, flip_green=False)
+            else:
+                textures['normal'] = generate_normal_map(diffuse, strength=0.8)
         if 'roughness' not in textures:
             thread_safe_callback({
                 "status": "progress",
@@ -443,6 +460,16 @@ class GenerationOrchestrator:
                 threshold=220,
             )
 
+        # 本地 PBR 模式下，从生成的法线反推高度图
+        using_local_pbr = data.get("use_local_pbr", False) or not self._is_comfyui_installed_for_data(data)
+        if using_local_pbr and 'height' not in textures and 'normal' in textures:
+            thread_safe_callback({
+                "status": "progress",
+                "progress": 0.88,
+                "message": "正在从法线生成高度图...",
+            })
+            textures['height'] = generate_height_from_normal(textures['normal'], flip_green=False)
+
         self._texture_result = textures
         thread_safe_callback({
             "status": "progress",
@@ -458,7 +485,7 @@ class GenerationOrchestrator:
         """后台线程生成 PBR 贴图：ComfyUI Zimage + CHORD 工作流提取 PBR。"""
         try:
             base_config = data["config"]
-            use_chord = True  # 始终使用 CHORD
+            use_chord = True  # 进入此函数说明 ComfyUI 健康检查已通过
 
             # 有参考图 + prompt 为空：直接处理参考图
             if base_config.init_image is not None and not data.get("has_user_prompt", False):
@@ -560,7 +587,7 @@ class GenerationOrchestrator:
 
             # 有参考图 + prompt 为空：直接处理参考图
             if base_config.init_image is not None and not data.get("has_user_prompt", False):
-                self._process_reference(data, use_chord=True)
+                self._process_reference(data, use_chord=self._is_comfyui_installed_for_data(data))
                 return
 
             thread_safe_callback({
@@ -579,7 +606,7 @@ class GenerationOrchestrator:
                 raise RuntimeError("API 未返回任何图像。")
 
             diffuse = result.images[0]
-            self._extract_pbr(diffuse, data, use_chord=True)
+            self._extract_pbr(diffuse, data, use_chord=self._is_comfyui_installed_for_data(data))
 
         except Exception as e:
             thread_safe_callback({
@@ -632,11 +659,11 @@ class GenerationOrchestrator:
 
             textures = filtered_textures
 
-            # 快速模式：用算法做无缝平铺，替代 Flux-Fill AI 修缝
-            # 保证所有显卡都能拿到无缝贴图（游戏贴图硬需求）
-            if data.get("fast_mode", False):
+            # 快速模式或启用本地 PBR 时：用本地算法做无缝平铺
+            if data.get("fast_mode", False) or data.get("use_local_pbr", False):
+                method = "ADVANCED" if data.get("use_local_pbr", False) else "BASIC"
                 for k in textures:
-                    textures[k] = self._make_seamless_tile(textures[k])
+                    textures[k] = make_seamless_tile_iem(textures[k], method=method)
 
             # 将贴图缩放到用户选择的输出尺寸
             # 快速模式生成于 1024²，高质量模式生成于 2048²，用户可能选了 512/1024/2048/4096

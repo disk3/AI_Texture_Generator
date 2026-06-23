@@ -14,11 +14,16 @@ from . import preferences as pref_utils
 log = get_logger(__name__)
 
 
-def _open_file_explorer(folder: str):
-    """Cross-platform file explorer: open `folder` in the OS file manager."""
+def _open_file_explorer(folder: str, select_file: str = ""):
+    """Cross-platform file explorer: open `folder` and optionally select a file."""
     folder = os.path.normpath(folder)
+    select_file = os.path.normpath(select_file) if select_file else ""
     if os.name == "nt":
-        os.startfile(folder)
+        if select_file and os.path.isfile(select_file):
+            # /select 会打开文件夹并高亮指定文件
+            subprocess.run(["explorer", f"/select,{select_file}"], check=False)
+        else:
+            os.startfile(folder)
     elif os.name == "posix":
         try:
             subprocess.run(["open", folder], check=False)
@@ -377,7 +382,7 @@ class AI_OT_OpenImageFolder(bpy.types.Operator):
             self.report({'WARNING'}, f"找不到文件夹: {folder}")
             return {'CANCELLED'}
 
-        _open_file_explorer(folder)
+        _open_file_explorer(folder, filepath)
         return {'FINISHED'}
 
 
@@ -650,6 +655,34 @@ class AI_OT_ClearResults(bpy.types.Operator):
         props.results.clear()
         preview_manager.clear_previews()
         props.active_result_index = -1
+        return {'FINISHED'}
+
+
+class AI_OT_RemoveResult(bpy.types.Operator):
+    bl_idname = "ai_concept.remove_result"
+    bl_label = "删除此结果"
+    bl_description = "删除该条结果及其关联的 Blender 图像"
+    bl_options = {'REGISTER'}
+
+    index: bpy.props.IntProperty(name="Index", default=-1)
+
+    def execute(self, context):
+        props = context.scene.ai_concept_props
+        idx = self.index
+        if idx < 0 or idx >= len(props.results):
+            return {'CANCELLED'}
+
+        item = props.results[idx]
+        for map_item in item.pbr_maps:
+            if map_item.image_name in bpy.data.images:
+                bpy.data.images.remove(bpy.data.images[map_item.image_name])
+        props.results.remove(idx)
+
+        # 清理预览并修正当前选中索引
+        preview_manager.clear_previews()
+        if props.active_result_index >= len(props.results):
+            props.active_result_index = len(props.results) - 1
+
         return {'FINISHED'}
 
 
@@ -1164,7 +1197,16 @@ class AI_OT_InstallComfyUI(bpy.types.Operator):
     bl_description = "下载并安装 ComfyUI（约 15 GB）+ 模型（约 10 GB），共需约 25 GB 磁盘空间，NVIDIA GPU 推荐"
     bl_options = {'REGISTER'}
 
+    install_path: bpy.props.StringProperty(
+        name="安装目录",
+        description="ComfyUI 将被下载并安装到此目录",
+        subtype='DIR_PATH',
+        default="",
+    )
+
     def invoke(self, context, event):
+        prefs = _get_prefs(context)
+        self.install_path = prefs.comfyui_path or comfyui_installer.get_default_install_path()
         return context.window_manager.invoke_props_dialog(self, width=480)
 
     def draw(self, context):
@@ -1175,6 +1217,8 @@ class AI_OT_InstallComfyUI(bpy.types.Operator):
         col.label(text=f"⚠ 预计需要约 25 GB 可用磁盘空间", icon='ERROR')
         col.label(text="⚠ 需要 NVIDIA GPU (4 GB+ 显存) 才能正常使用", icon='ERROR')
         col.label(text="⚠ 下载可能需要 15~60 分钟（取决于网络）", icon='ERROR')
+        col.separator()
+        col.prop(self, "install_path")
         col.separator()
         col.label(text="仅需执行一次，安装完成后即可使用本地 ComfyUI。")
         col.separator()
@@ -1191,7 +1235,9 @@ class AI_OT_InstallComfyUI(bpy.types.Operator):
             return {'CANCELLED'}
 
         prefs = _get_prefs(context)
-        target = _get_install_path(prefs)
+        target = self.install_path or _get_install_path(prefs)
+        if self.install_path:
+            prefs.comfyui_path = self.install_path
 
         state["running"] = True
         state["status"] = "准备中..."
@@ -1348,6 +1394,7 @@ classes = [
     AI_PT_PromptEditorPanel,
     AI_MT_ReferenceImageMenu,
     AI_OT_ClearResults,
+    AI_OT_RemoveResult,
     AI_OT_PrevResult,
     AI_OT_NextResult,
     AI_OT_OpenImageFolder,
