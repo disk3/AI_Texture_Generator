@@ -138,9 +138,13 @@ def _box_blur(arr: np.ndarray, percent: float = 1.0, edge_mode: str = "edge") ->
 def _compute_normal_from_height(
     height: np.ndarray,
     strength: float = 2.0,
-    flip_green: bool = False,
+    invert: bool = False,
 ) -> np.ndarray:
-    """灰度高度图 → RGBA 法线贴图（OpenGL 切线空间）。"""
+    """灰度高度图 → RGBA 法线贴图（OpenGL 切线空间）。
+
+    Args:
+        invert: 反转法线 R/X 方向（与 Image Editor Master 的“反转绿色通道”行为一致）。
+    """
     gray = np.clip(height.astype(np.float32), 0.0, 1.0)
     h, w = gray.shape
 
@@ -155,8 +159,8 @@ def _compute_normal_from_height(
 
     nx = -dx * strength
     ny = -dy * strength
-    if flip_green:
-        ny = -ny
+    if invert:
+        nx = -nx
     nz = np.ones_like(gray)
 
     length = np.sqrt(nx * nx + ny * ny + nz * nz)
@@ -175,27 +179,27 @@ def _compute_normal_from_height(
 
 def generate_normal_from_diffuse(
     diffuse: Image.Image,
-    strength: float = 2.0,
-    detail: float = 0.5,
-    flip_green: bool = False,
+    strength: float = 1.5,
+    detail: float = 0.4,
+    invert: bool = False,
 ) -> Image.Image:
     """从漫反射贴图生成法线贴图。
 
     Args:
-        strength: 凹凸强度。
+        strength: 凹凸强度。默认 1.5 更接近 Image Editor Master GPU 输出。
         detail: 0~1，越高保留越多高频细节；0 只保留大形。
-        flip_green: 是否反转绿色通道（Y 方向）。
+        invert: 反转法线 R/X 方向（与 Image Editor Master 的“反转绿色通道”行为一致）。
     """
     rgba = _image_to_float_rgba(diffuse)
 
     if detail <= 0.0:
-        normal = _compute_normal_from_height(_to_grayscale(rgba), strength, flip_green)
+        normal = _compute_normal_from_height(_to_grayscale(rgba), strength, invert)
     else:
-        full = _compute_normal_from_height(_to_grayscale(rgba), strength, flip_green)
+        full = _compute_normal_from_height(_to_grayscale(rgba), strength, invert)
         gray = _to_grayscale(rgba)
         smooth_gray = _box_blur(gray, 1.5, "edge")
         smooth_rgba = np.stack([smooth_gray, smooth_gray, smooth_gray, rgba[..., 3]], axis=-1)
-        base = _compute_normal_from_height(_to_grayscale(smooth_rgba), strength, flip_green)
+        base = _compute_normal_from_height(_to_grayscale(smooth_rgba), strength, invert)
         result = np.zeros_like(full)
         result[..., :3] = np.clip(base[..., :3] + (full[..., :3] - base[..., :3]) * detail, 0.0, 1.0)
         result[..., 3] = full[..., 3]

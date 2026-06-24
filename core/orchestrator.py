@@ -22,6 +22,33 @@ from ..sd_backend import comfyui_installer
 log = get_logger(__name__)
 
 
+def _sanitize_filename(name: str, max_len: int = 64) -> str:
+    """将字符串转换为安全的文件/文件夹名称。
+
+    移除 Windows / 多数文件系统不支持的字符，并截断长度。
+    """
+    import re
+    # Windows 非法字符
+    name = re.sub(r'[\\/:*?"<>|]', '_', name)
+    # 控制字符
+    name = re.sub(r'[\x00-\x1f]', '', name)
+    # 首尾空格/句点
+    name = name.strip(' .')
+    # 避免 Windows 保留名
+    reserved = {
+        'CON', 'PRN', 'AUX', 'NUL',
+        'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9',
+        'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9',
+    }
+    if name.upper() in reserved:
+        name = f"_{name}"
+    if not name:
+        name = "unnamed"
+    if len(name) > max_len:
+        name = name[:max_len].rsplit('_', 1)[0]
+    return name
+
+
 class GenerationOrchestrator:
     def __init__(self):
         self._pool = ConnectionPool()
@@ -43,13 +70,18 @@ class GenerationOrchestrator:
         props = context.scene.ai_concept_props
         texture_generator = getattr(props, "texture_generator", "LOCAL_COMFYUI")
 
-        # 选择 Local ComfyUI 但未安装时，弹出安装确认对话框
+        # 选择 Local ComfyUI 但未安装时，弹出安装确认对话框。
+        # 例外：参考图模式 + 无用户 prompt + 启用本地 PBR 时，可直接处理原图，无需 ComfyUI。
         if texture_generator == 'LOCAL_COMFYUI':
             install_path = prefs.comfyui_path or comfyui_installer.get_default_install_path()
             if not comfyui_installer.is_comfyui_installed(install_path):
-                props.is_generating = False
-                bpy.ops.ai_concept.install_comfyui('INVOKE_DEFAULT')
-                return
+                has_reference = getattr(props, 'reference_image', None) is not None
+                has_prompt = bool(props.prompt.strip())
+                use_local_pbr = getattr(props, "use_local_pbr", False)
+                if not (has_reference and not has_prompt and use_local_pbr):
+                    props.is_generating = False
+                    bpy.ops.ai_concept.install_comfyui('INVOKE_DEFAULT')
+                    return
 
         # ---- 主线程中安全执行所有 bpy 操作 ----
         obj = context.active_object
@@ -229,6 +261,9 @@ class GenerationOrchestrator:
 
         # 将用户本地 PBR 开关传递给后台线程
         data["use_local_pbr"] = getattr(props, "use_local_pbr", False)
+        data["normal_strength"] = getattr(props, "normal_strength", 1.5)
+        data["normal_detail"] = getattr(props, "normal_detail", 0.4)
+        data["normal_invert"] = getattr(props, "normal_invert", False)
 
         self._thread = threading.Thread(
             target=self._generate_worker,
@@ -245,6 +280,23 @@ class GenerationOrchestrator:
         try:
             backend_type = data["backend_type"]
             url = data["url"]
+            base_config = data["config"]
+
+            # 参考图模式 + 无用户 prompt + 启用本地 PBR/ComfyUI 未安装：
+            # 直接本地处理参考图，无需初始化任何后端客户端。
+            is_reference_mode = (
+                base_config.init_image is not None
+                and not data.get("has_user_prompt", False)
+            )
+            use_local_pbr = data.get("use_local_pbr", False)
+            if is_reference_mode and (use_local_pbr or not self._is_comfyui_installed_for_data(data)):
+                thread_safe_callback({
+                    "status": "progress",
+                    "progress": 0.1,
+                    "message": "正在本地处理参考图...",
+                })
+                self._process_reference(data, use_chord=False)
+                return
 
             thread_safe_callback({
                 "status": "progress",
@@ -432,7 +484,12 @@ class GenerationOrchestrator:
                 "message": "正在提取法线贴图...",
             })
             if data.get("use_local_pbr", False) or not self._is_comfyui_installed_for_data(data):
-                textures['normal'] = generate_normal_from_diffuse(diffuse, strength=2.0, detail=0.5, flip_green=False)
+                textures['normal'] = generate_normal_from_diffuse(
+                    diffuse,
+                    strength=data.get("normal_strength", 1.5),
+                    detail=data.get("normal_detail", 0.4),
+                    invert=data.get("normal_invert", False),
+                )
             else:
                 textures['normal'] = generate_normal_map(diffuse, strength=0.8)
         if 'roughness' not in textures:
@@ -674,11 +731,19 @@ class GenerationOrchestrator:
                     textures[k] = textures[k].resize((target_w, target_h), Image.LANCZOS)
 
             output_dir = data.get("asset_output_path", "")
+            if not output_dir or not os.path.isdir(output_dir):
+                thread_safe_callback({
+                    "status": "error",
+                    "message": "资源输出目录无效，请在偏好设置 > 输出中设置有效的目录",
+                })
+                return
+
             images = {}
             batch_id = time.strftime("%Y%m%d_%H%M%S")
+            safe_obj_name = _sanitize_filename(obj.name)
 
             for map_type, pil_img in textures.items():
-                img_name = f"{obj.name}_{map_type}_{batch_id}"
+                img_name = f"{safe_obj_name}_{map_type}_{batch_id}"
                 blender_img = bpy.data.images.new(
                     name=img_name,
                     width=pil_img.size[0],
@@ -703,7 +768,7 @@ class GenerationOrchestrator:
                 images[map_type] = blender_img
 
             mat = ShaderBuilder.build_principled_bsdf(
-                f"Mat_{obj.name}_PBR",
+                f"Mat_{safe_obj_name}_PBR",
                 images,
                 output_config=output_config,
             )
@@ -715,7 +780,7 @@ class GenerationOrchestrator:
 
             # 记录到结果列表
             item = props.results.add()
-            item.name = f"PBR {obj.name} ({batch_id})"
+            item.name = f"PBR {safe_obj_name} ({batch_id})"
             item.result_type = 'pbr'
             item.timestamp = batch_id
 

@@ -604,6 +604,30 @@ class CTProperties(bpy.types.PropertyGroup):
     output_metalness: bpy.props.BoolProperty(name="Metalness", default=True, description="输出 Metallic 贴图")
     output_height: bpy.props.BoolProperty(name="Height", default=True, description="输出 Height / Displacement 贴图")
 
+    # 本地 PBR 法线生成参数（仅在不用 ComfyUI 时生效）
+    normal_strength: bpy.props.FloatProperty(
+        name="法线强度",
+        default=1.5,
+        min=0.1,
+        max=10.0,
+        soft_min=0.5,
+        soft_max=5.0,
+        description="本地算法生成法线时的凹凸强度（Image Editor Master GPU 效果约对应 1.5）",
+    )
+    normal_detail: bpy.props.FloatProperty(
+        name="法线细节",
+        default=0.4,
+        min=0.0,
+        max=1.0,
+        subtype='FACTOR',
+        description="0=只保留大形，1=保留全部高频细节（Image Editor Master GPU 效果约对应 0.4）",
+    )
+    normal_invert: bpy.props.BoolProperty(
+        name="反转绿色通道",
+        default=False,
+        description="与 Image Editor Master 的‘反转绿色通道’选项行为一致：实际反转法线的 R/X 方向",
+    )
+
     # 通道打包（Channel Packed）
     enable_channel_pack: bpy.props.BoolProperty(
         name="Channel Packed",

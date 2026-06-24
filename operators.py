@@ -674,12 +674,12 @@ class AI_OT_RemoveResult(bpy.types.Operator):
 
         item = props.results[idx]
         for map_item in item.pbr_maps:
+            preview_manager.remove_preview(map_item.image_name)
             if map_item.image_name in bpy.data.images:
                 bpy.data.images.remove(bpy.data.images[map_item.image_name])
         props.results.remove(idx)
 
-        # 清理预览并修正当前选中索引
-        preview_manager.clear_previews()
+        # 修正当前选中索引
         if props.active_result_index >= len(props.results):
             props.active_result_index = len(props.results) - 1
 

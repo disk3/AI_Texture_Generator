@@ -167,6 +167,23 @@ class AI_PT_TexturePanel(bpy.types.Panel):
             row = box.row(align=True)
             row.prop(props, "use_local_pbr", text="不用 ComfyUI，本地生成 PBR")
 
+        # 本地 PBR 法线参数（紧接在「不用 ComfyUI」开关下方）
+        show_local_normal = props.use_local_pbr
+        try:
+            show_local_normal = show_local_normal or not _is_local_comfyui_ready(prefs)
+        except Exception:
+            show_local_normal = True
+        if show_local_normal:
+            try:
+                box = layout.box()
+                box.label(text="本地法线参数", icon='MATERIAL')
+                _prop_row(box, props, "normal_strength", "强度")
+                _prop_row(box, props, "normal_detail", "细节")
+                box.prop(props, "normal_invert", text="反转绿色通道")
+            except Exception as e:
+                box = layout.box()
+                box.label(text=f"法线参数显示错误: {e}", icon='ERROR')
+
         # Maps
         box = layout.box()
         box.label(text="贴图输出", icon='TEXTURE')
@@ -258,7 +275,14 @@ class AI_PT_TexturePanel(bpy.types.Panel):
                     row.alignment = 'CENTER'
                     for mt in display_types[i:i+2]:
                         col = row.column(align=True)
-                        icon_id = preview_manager.get_icon_id(maps.get(mt, ''))
+                        image_name = maps.get(mt, '')
+                        icon_id = preview_manager.get_icon_id(image_name)
+                        # 预览未加载时尝试从输出目录重新加载
+                        if not icon_id and image_name:
+                            output_dir = prefs.asset_output_path
+                            if output_dir:
+                                filepath = os.path.join(output_dir, f"{image_name}.png")
+                                icon_id = preview_manager.load_preview(image_name, filepath)
                         if icon_id:
                             col.template_icon(icon_id, scale=6.0)
                         else:
