@@ -1,6 +1,3 @@
-from .comfyui_client import ComfyUIClient
-from .gpt_image_client import GPTImageClient
-from .nanobanana_client import NanobananaClient
 from ..utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -11,6 +8,19 @@ class ConnectionPool:
         self._clients = {}
 
     def get_client(self, backend_type: str, url: str, **kwargs):
+        # 延迟导入具体客户端：缺少 requests/websocket 时仍可加载本地 PBR 功能
+        if backend_type == 'COMFYUI':
+            from .comfyui_client import ComfyUIClient
+            client_cls = ComfyUIClient
+        elif backend_type == 'GPT_IMAGE':
+            from .gpt_image_client import GPTImageClient
+            client_cls = GPTImageClient
+        elif backend_type == 'NANOBANANA':
+            from .nanobanana_client import NanobananaClient
+            client_cls = NanobananaClient
+        else:
+            raise ValueError(f"Unknown backend type: {backend_type}")
+
         key = f"{backend_type}@{url}"
         # API 客户端的 base_url 决定实际连接目标，必须纳入 key
         if backend_type in ('GPT_IMAGE', 'NANOBANANA'):
@@ -26,15 +36,15 @@ class ConnectionPool:
 
         if key not in self._clients:
             if backend_type == 'COMFYUI':
-                self._clients[key] = ComfyUIClient(base_url=url, **kwargs)
+                self._clients[key] = client_cls(base_url=url, **kwargs)
             elif backend_type == 'GPT_IMAGE':
-                self._clients[key] = GPTImageClient(
+                self._clients[key] = client_cls(
                     api_key=kwargs.get("api_key", ""),
                     model=kwargs.get("model", "gpt-image-2"),
                     base_url=kwargs.get("base_url", ""),
                 )
             elif backend_type == 'NANOBANANA':
-                self._clients[key] = NanobananaClient(
+                self._clients[key] = client_cls(
                     api_key=kwargs.get("api_key", ""),
                     base_url=kwargs.get("base_url", "https://generativelanguage.googleapis.com/v1beta"),
                     model=kwargs.get("model", "gemini-2.5-flash-image"),

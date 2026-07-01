@@ -1,6 +1,7 @@
 import threading
 import bpy
 import os
+import sys
 import time
 import numpy as np
 from PIL import Image, ImageOps, ImageChops, ImageDraw, ImageFilter
@@ -421,6 +422,22 @@ class GenerationOrchestrator:
         effective_use_chord = self._should_use_chord(data, use_chord)
 
         if effective_use_chord:
+            # 检查 ComfyUI 后端依赖
+            missing_backend = []
+            for pkg in ("requests", "websocket"):
+                try:
+                    __import__(pkg)
+                except ImportError:
+                    missing_backend.append(pkg)
+            if missing_backend:
+                msg = (
+                    "使用 ComfyUI/CHORD 需要安装后端依赖：\n"
+                    f"{sys.executable} -m pip install {' '.join(missing_backend)}\n"
+                    "或勾选「不用 ComfyUI，本地生成 PBR」跳过 ComfyUI。"
+                )
+                thread_safe_callback({"status": "error", "message": msg})
+                return
+
             chord_success = False
             try:
                 comfyui_path = data.get("comfyui_path", "") or comfyui_installer.get_default_install_path()

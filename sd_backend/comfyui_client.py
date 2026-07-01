@@ -3,12 +3,10 @@ import os
 import time
 import uuid
 import random
-import websocket
 from typing import Dict
 from PIL import Image
 import io
 import base64
-import requests
 
 from .abstract_client import AbstractSDClient, GenerationConfig, GenerationResult
 from ..utils.logger import get_logger
@@ -28,6 +26,7 @@ class ComfyUIClient(AbstractSDClient):
 
     def check_health(self, auto_launch_path: str = "") -> bool:
         """检查 ComfyUI 是否在线，若不在线且提供了安装路径则自动启动。"""
+        import requests
         try:
             r = requests.get(f"{self.base_url}/system_stats", timeout=5)
             if r.status_code == 200:
@@ -219,6 +218,7 @@ class ComfyUIClient(AbstractSDClient):
         return ""
 
     def _upload_image(self, pil_img: Image.Image, name: str = "input") -> str:
+        import requests
         buffer = io.BytesIO()
         pil_img.save(buffer, format="PNG")
         files = {"image": (f"{name}.png", buffer.getvalue(), "image/png")}
@@ -228,6 +228,8 @@ class ComfyUIClient(AbstractSDClient):
         return resp.json().get("name", f"{name}.png")
 
     def _execute_workflow(self, workflow: dict, output_mode: str = "flat") -> GenerationResult:
+        import requests
+        import websocket
         client_id = str(uuid.uuid4())
         ws = websocket.create_connection(f"{self.ws_url}?clientId={client_id}", timeout=self.timeout)
 
@@ -262,6 +264,7 @@ class ComfyUIClient(AbstractSDClient):
             if self._progress_cb:
                 self._progress_cb(0.9, "正在获取结果图像...")
 
+            import requests
             history_resp = requests.get(f"{self.base_url}/history/{prompt_id}", timeout=30)
             history = history_resp.json()
             outputs = history.get(prompt_id, {}).get("outputs", {})
@@ -284,6 +287,7 @@ class ComfyUIClient(AbstractSDClient):
                         "prefix": prefix,
                         "filename": filename,
                     })
+                    import requests
                     img_resp = requests.get(
                         f"{self.base_url}/view?filename={filename}&subfolder={img_info.get('subfolder', '')}&type={img_info.get('type', 'output')}",
                         timeout=30,

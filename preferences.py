@@ -1,5 +1,4 @@
 import bpy
-import requests
 import time
 import os
 import sys
@@ -246,6 +245,8 @@ class AI_OT_TestProviderConnection(bpy.types.Operator):
     provider: bpy.props.StringProperty(default='COMFYUI')
 
     def execute(self, context):
+        import requests
+
         addon_pkg = __package__.split('.')[0]
         prefs = context.preferences.addons[addon_pkg].preferences
 
@@ -513,6 +514,7 @@ class AI_OT_FetchModels(bpy.types.Operator):
 
     def _fetch_openai_models(self, url: str, api_key: str) -> list:
         """请求 OpenAI 兼容 /models，返回原始模型 ID 列表。"""
+        import requests
         headers = self._model_headers(api_key, "openai")
         resp = requests.get(url, headers=headers, timeout=15)
         if resp.status_code in (301, 302, 303, 307, 308):
@@ -531,6 +533,7 @@ class AI_OT_FetchModels(bpy.types.Operator):
 
     def _fetch_gemini_models(self, url: str, api_key: str) -> list:
         """请求 Gemini /v1beta/models，返回模型名列表。"""
+        import requests
         req_url = f"{self._models_url(url, 'gemini')}?key={api_key}"
         resp = requests.get(req_url, timeout=15)
         if self._looks_like_html(resp.text):

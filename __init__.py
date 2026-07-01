@@ -1,7 +1,7 @@
 bl_info = {
     "name": "AI 材质生成",
     "author": "Xiong Meng Han",
-    "version": (1, 0, 0),
+    "version": (1, 1, 1),
     "blender": (3, 6, 0),
     "location": "3D 视图 > 侧边栏 (N) > AI 材质",
     "description": "从提示词或参考图一键生成 PBR 材质贴图（支持本地 ComfyUI 与在线 API）",
@@ -25,10 +25,14 @@ modules = []
 #   queue, threading, time, uuid, random, subprocess, shutil, tempfile, urllib,
 #   logging, ctypes, re, webbrowser, signal, abc, dataclasses, typing
 # 以下为需要用户自行安装的第三方包（安装到 Blender 的 site-packages）:
+# 基础依赖：本地 PBR（法线、无缝、高度图反推）必需
 _REQUIRED_PACKAGES = {
-    "requests":        "HTTP 客户端（API 调用、ComfyUI 通信）",
     "PIL":             "图像处理（贴图读写、格式转换）",
     "numpy":           "数值计算（贴图像素处理）",
+}
+# 后端依赖：仅在使用 ComfyUI / API 时才需要；本地 PBR 用户可暂不安装
+_BACKEND_PACKAGES = {
+    "requests":        "HTTP 客户端（API 调用、ComfyUI 通信）",
     "websocket":       "WebSocket 客户端（ComfyUI 实时通信）",
 }
 _OPTIONAL_PACKAGES = {
@@ -45,35 +49,42 @@ def _check_runtime_dependencies() -> list:
             __import__(pkg)
         except ImportError:
             missing.append(f"{pkg} ({desc})")
-    # 可选包仅记录日志，不阻止加载
-    for pkg, desc in _OPTIONAL_PACKAGES.items():
-        try:
-            __import__(pkg)
-        except ImportError:
-            log.debug("Optional package '%s' not found: %s", pkg, desc)
     return missing
 
 
-def _show_dependency_warning(missing: list):
+def _check_backend_dependencies() -> list:
+    """检查 ComfyUI / API 后端所需的依赖，返回缺失包名列表。"""
+    missing = []
+    for pkg, desc in _BACKEND_PACKAGES.items():
+        try:
+            __import__(pkg)
+        except ImportError:
+            missing.append(f"{pkg} ({desc})")
+    return missing
+
+
+def _format_missing_packages(missing: list) -> str:
+    """生成依赖安装命令提示。"""
+    names = [m.split()[0] for m in missing]
+    return (
+        "请将以下包安装到 Blender 的 Python 环境中：\n\n"
+        f"  {sys.executable} -m pip install {' '.join(names)}\n\n"
+        "安装后请重启 Blender 并重新启用插件。"
+    )
+
+
+def _show_dependency_warning(missing: list, title: str = "AI 材质生成插件检测到缺失的 Python 包"):
     """通过 Blender 弹窗提示用户安装缺失的依赖。"""
     import textwrap
     lines = [
-        "AI 材质生成插件检测到缺失的 Python 包：",
+        title,
         "",
     ]
     for m in missing:
         lines.append(f"  • {m}")
     lines.extend([
         "",
-        "请将以下包安装到 Blender 的 Python 环境中：",
-        "",
-        f"  {sys.executable} -m pip install requests Pillow numpy websocket-client",
-        "",
-        "可选（推荐安装以获得最佳效果）：",
-        "",
-        f"  {sys.executable} -m pip install opencv-python py7zr",
-        "",
-        "安装后请重启 Blender 并重新启用插件。",
+        _format_missing_packages(missing),
     ])
 
     def _draw_warning(self_dummy, context):
@@ -116,20 +127,19 @@ def _shutdown_on_exit():
 
 
 def register():
-    # ── 依赖检查 ──
+    # ── 基础依赖检查（本地 PBR 必需：PIL / numpy） ──
     missing = _check_runtime_dependencies()
     if missing:
         log.error("Missing dependencies: %s", ", ".join(missing))
-        _show_dependency_warning(missing)
+        _show_dependency_warning(missing, "AI 材质生成插件缺少必需的 Python 包")
         raise RuntimeError(
             "AI 材质生成插件缺少必需的 Python 包，请安装后重启 Blender。\n"
             f"缺失: {', '.join(missing)}\n"
-            f"运行: {sys.executable} -m pip install requests Pillow numpy websocket-client"
+            f"运行: {sys.executable} -m pip install Pillow numpy"
         )
 
     from . import preferences, operators, panels, properties
     from .core import orchestrator
-    from .sd_backend import comfyui_client
     from .utils import async_bridge
     from .ui import preview_manager
 
@@ -140,10 +150,16 @@ def register():
         operators,
         panels,
         orchestrator,
-        comfyui_client,
         async_bridge,
         preview_manager,
     ])
+
+    # 后端模块（ComfyUI 客户端）可选加载：缺少 requests/websocket 时仍可启用本地 PBR
+    try:
+        from .sd_backend import comfyui_client
+        modules.append(comfyui_client)
+    except ImportError as e:
+        log.warning("ComfyUI 客户端未能加载（缺少 requests/websocket 等后端依赖）：%s", e)
 
     for mod in modules:
         if hasattr(mod, "register"):

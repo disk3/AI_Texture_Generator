@@ -8,7 +8,6 @@ import re
 import signal
 import subprocess
 import time
-import requests
 
 from ..utils.logger import get_logger
 
@@ -235,6 +234,7 @@ def shutdown_comfyui(base_url: str = ""):
 
 def wait_for_comfyui(base_url: str, timeout: int = 120) -> bool:
     """轮询等待 ComfyUI 启动成功。"""
+    import requests
     url = base_url.rstrip("/") + "/system_stats"
     for _ in range(timeout):
         try:
@@ -250,6 +250,7 @@ def wait_for_comfyui(base_url: str, timeout: int = 120) -> bool:
 
 def is_comfyui_running(base_url: str) -> bool:
     """检查 ComfyUI 是否已响应。"""
+    import requests
     try:
         resp = requests.get(base_url.rstrip("/") + "/system_stats", timeout=3)
         return resp.status_code == 200
