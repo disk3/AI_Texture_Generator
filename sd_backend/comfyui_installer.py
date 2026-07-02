@@ -174,18 +174,117 @@ def resolve_comfyui_path(prefs_or_path) -> str:
     return path or get_default_install_path()
 
 
-def is_comfyui_installed(path: str) -> bool:
-    """检查指定路径是否是可用的 ComfyUI portable 安装。"""
+def get_comfyui_type(path: str) -> Optional[str]:
+    """判断 ComfyUI 安装类型。
+
+    返回：
+        "portable" — 便携版（存在 ComfyUI/main.py + python_embeded/python.exe）
+        "desktop"  — 桌面版/git 版（存在 ComfyUI/main.py，使用系统 Python）
+        None       — 不是有效 ComfyUI 目录
+    """
     if not path or not os.path.isdir(path):
-        return False
+        return None
     main_py = os.path.join(path, "ComfyUI", "main.py")
+    if not os.path.isfile(main_py):
+        return None
     python_exe = os.path.join(path, "python_embeded", "python.exe")
-    return os.path.isfile(main_py) and os.path.isfile(python_exe)
+    return "portable" if os.path.isfile(python_exe) else "desktop"
 
 
-def get_python_exe(comfyui_path: str) -> str:
-    """返回 ComfyUI portable 的 embedded python 可执行文件路径。"""
-    return os.path.join(comfyui_path, "python_embeded", "python.exe")
+def is_comfyui_installed(path: str) -> bool:
+    """检查指定路径是否是可用的 ComfyUI 安装（支持便携版与桌面版）。"""
+    return get_comfyui_type(path) is not None
+
+
+def _is_valid_python(python_exe: str) -> bool:
+    """验证给定路径/命令的 Python 可执行文件可用。"""
+    try:
+        result = subprocess.run(
+            [python_exe, "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            timeout=5,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def get_python_exe(comfyui_path: str) -> Optional[str]:
+    """返回启动 ComfyUI 可用的 Python 可执行文件路径。
+
+    便携版返回 embedded python；桌面版优先查找 venv/python_embeded，
+    最后回退到系统 python/python3。
+    """
+    ctype = get_comfyui_type(comfyui_path)
+    if ctype == "portable":
+        return os.path.join(comfyui_path, "python_embeded", "python.exe")
+
+    if ctype == "desktop":
+        # 桌面版常见 Python 环境（按优先级）
+        candidates = []
+        if os.name == "nt":
+            candidates.extend([
+                os.path.join(comfyui_path, "venv", "Scripts", "python.exe"),
+                os.path.join(comfyui_path, ".venv", "Scripts", "python.exe"),
+                os.path.join(comfyui_path, "python_embeded", "python.exe"),
+            ])
+        else:
+            candidates.extend([
+                os.path.join(comfyui_path, "venv", "bin", "python"),
+                os.path.join(comfyui_path, ".venv", "bin", "python"),
+                os.path.join(comfyui_path, "venv", "bin", "python3"),
+                os.path.join(comfyui_path, ".venv", "bin", "python3"),
+            ])
+        for exe in candidates:
+            if _is_valid_python(exe):
+                return exe
+
+        # 回退到系统 Python
+        for exe in ("python.exe", "python3.exe", "python", "python3"):
+            if _is_valid_python(exe):
+                return exe
+    return None
+
+
+# 扫描时会纳入的模型子目录
+_MODEL_SCAN_SUBDIRS = ("checkpoints", "unet")
+
+
+def scan_comfyui_models(path: str) -> Dict[str, List[str]]:
+    """扫描指定 ComfyUI 安装目录下的模型文件。
+
+    只扫描 ComfyUI/models 下的常见模型子目录（checkpoints/unet 等）。
+
+    返回：
+        {子目录名: [文件名列表]}，例如
+        {'checkpoints': ['chord_v1.safetensors'], 'unet': ['z_image_turbo_bf16.safetensors']}
+    """
+    if not path or not os.path.isdir(path):
+        return {}
+    models_dir = os.path.join(path, "ComfyUI", "models")
+    if not os.path.isdir(models_dir):
+        return {}
+    result: Dict[str, List[str]] = {}
+    for subdir in os.listdir(models_dir):
+        subdir_path = os.path.join(models_dir, subdir)
+        if not os.path.isdir(subdir_path):
+            continue
+        files = []
+        for name in os.listdir(subdir_path):
+            if name.startswith("."):
+                continue
+            lower = name.lower()
+            if lower.endswith((".txt", ".md", ".json", ".ini", ".py", ".cache")):
+                continue
+            file_path = os.path.join(subdir_path, name)
+            if os.path.isfile(file_path):
+                files.append(name)
+        if files:
+            files.sort(key=str.lower)
+            result[subdir] = files
+    return result
 
 
 def _run_subprocess(cmd: List[str], cwd: Optional[str] = None) -> Tuple[int, str, str]:

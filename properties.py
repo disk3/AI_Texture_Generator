@@ -466,6 +466,25 @@ def _update_texture_prompt(self, context):
     self.prompt = build_texture_prompt(self)
 
 
+def _get_local_comfyui_model_items(self, context):
+    """从偏好设置缓存的本地 ComfyUI 模型列表生成枚举项。
+
+    列出 diffusion_models / unet 目录下的模型，用于替换工作流中的生图主模型。
+    """
+    items = [('DEFAULT', "使用工作流默认", "")]
+    try:
+        addon_pkg = __package__.split('.')[0]
+        prefs = context.preferences.addons[addon_pkg].preferences
+        for model in prefs.comfyui_models:
+            if model.model_kind in ("unet", "diffusion_models") and model.model_id:
+                items.append((model.model_id, model.label or model.model_id, ""))
+    except Exception:
+        pass
+    if len(items) == 1:
+        items.append(('__EMPTY__', "（请先刷新本地模型列表）", ""))
+    return items
+
+
 # =============================================================================
 # PropertyGroup
 # =============================================================================
@@ -518,18 +537,10 @@ class CTProperties(bpy.types.PropertyGroup):
     )
     batch_size: bpy.props.IntProperty(name="批量数量", default=1, min=1, max=4)
 
-    # 快速模式：跳过 SeedVR2 超分 + Flux-Fill 修缝，Z-Image 1024² 直接送 CHORD
-    # 可大幅降低显存占用和生成时间。最终输出始终按用户选择的尺寸缩放。
-    fast_mode: bpy.props.BoolProperty(
-        name="快速模式",
-        description="开启：省显存、速度快，适合低显存卡和日常出图。关闭：质量更高但需要更高显存",
-        default=False,
-    )
-
     # 本地 PBR 提取：不依赖 ComfyUI/CHORD，用 CPU 算法生成法线与无缝贴图
     use_local_pbr: bpy.props.BoolProperty(
-        name="不用 ComfyUI，本地生成 PBR",
-        description="勾选后法线、无缝等处理全部在 Blender 内完成，不需要 ComfyUI/CHORD",
+        name="本地离线 PBR 烘焙",
+        description="勾选 = Blender 本地计算 PBR；取消 = 跳转 ComfyUI 生成",
         default=False,
     )
 
@@ -593,6 +604,13 @@ class CTProperties(bpy.types.PropertyGroup):
     api_text_model: bpy.props.EnumProperty(
         name="Text Model",
         items=get_api_text_model_items,
+    )
+
+    # 本地 ComfyUI 工作流模型选择（由偏好设置"刷新本地模型列表"填充）
+    local_comfyui_model: bpy.props.EnumProperty(
+        name="主模型",
+        description="选择 ComfyUI/models/unet 中已下载的文生图/图生图主模型（如 Z-Image Turbo）。'使用工作流默认' 表示不覆盖",
+        items=_get_local_comfyui_model_items,
     )
 
     # PBR 提取参数已删除：默认始终使用 CHORD，Blender 算法仅作为 CHORD 失败时的 fallback。

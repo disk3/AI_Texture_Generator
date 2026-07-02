@@ -40,7 +40,8 @@ class GenerationConfig:
     denoising_strength: float = 0.75
     reference_tile_strength: float = 0.5
     use_chord_enhanced: bool = True
-    fast_mode: bool = False
+    # 本地 ComfyUI 工作流模型覆盖：{节点 ID: {输入字段: 值}}
+    model_overrides: Dict[str, Dict] = field(default_factory=dict)
 
 
 @dataclass

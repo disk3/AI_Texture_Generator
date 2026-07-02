@@ -79,29 +79,38 @@ def _parse_bat_args(bat_path: str) -> list:
 
 
 def _build_launch_cmd(comfyui_path: str) -> list:
-    """构建启动命令列表（优先直接调用 python，避免 bat 脚本里的 --auto-launch 弹出浏览器）。"""
-    python_exe = os.path.join(comfyui_path, "python_embeded", "python.exe")
+    """构建启动命令列表（优先直接调用 python，避免 bat 脚本里的 --auto-launch 弹出浏览器）。
+
+    支持两种目录结构：
+      - 便携版：<root>/ComfyUI/main.py + <root>/python_embeded/python.exe
+      - 桌面版：<root>/ComfyUI/main.py（使用系统 Python）
+    """
+    from .comfyui_installer import get_comfyui_type, get_python_exe
+
+    ctype = get_comfyui_type(comfyui_path)
+    if ctype is None:
+        return []
+
     main_py = os.path.join(comfyui_path, "ComfyUI", "main.py")
+    python_exe = get_python_exe(comfyui_path)
+    if not python_exe:
+        return []
 
-    # 优先：便携版 Windows 结构
-    if os.path.isfile(python_exe) and os.path.isfile(main_py):
-        return _sanitize_auto_launch([python_exe, "-s", main_py, "--windows-standalone-build", "--disable-auto-launch"])
+    args = [python_exe, "-s", main_py, "--disable-auto-launch"]
+    if ctype == "portable":
+        args.append("--windows-standalone-build")
 
-    # fallback: 尝试用系统 python 启动根目录 main.py
-    main_py2 = os.path.join(comfyui_path, "main.py")
-    if os.path.isfile(main_py2):
-        return _sanitize_auto_launch(["python", "-s", main_py2, "--disable-auto-launch"])
-
-    # fallback: 从 bat 脚本提取参数，转成 python 命令（避免直接执行 bat 弹窗/弹浏览器）
+    # fallback: 从 bat 脚本提取额外参数
     bat = _find_launch_script(comfyui_path)
-    if bat and os.path.isfile(python_exe) and os.path.isfile(main_py):
-        extra_args = _parse_bat_args(bat)
-        return _sanitize_auto_launch([python_exe, "-s", main_py, "--windows-standalone-build", "--disable-auto-launch"] + extra_args)
-
     if bat:
-        return [bat]
+        extra_args = _parse_bat_args(bat)
+        # 过滤掉会与上面冲突的参数
+        seen = set(args)
+        for a in extra_args:
+            if a not in seen:
+                args.append(a)
 
-    return []
+    return _sanitize_auto_launch(args)
 
 
 _comfyui_process = None
@@ -238,7 +247,8 @@ def wait_for_comfyui(base_url: str, timeout: int = 120) -> bool:
     url = base_url.rstrip("/") + "/system_stats"
     for _ in range(timeout):
         try:
-            resp = requests.get(url, timeout=2)
+            # connect 1s / read 4s，避免启动初期响应慢被误判为失败
+            resp = requests.get(url, timeout=(1, 4))
             if resp.status_code == 200:
                 return True
         except (requests.ConnectionError, requests.Timeout):
@@ -252,7 +262,7 @@ def is_comfyui_running(base_url: str) -> bool:
     """检查 ComfyUI 是否已响应。"""
     import requests
     try:
-        resp = requests.get(base_url.rstrip("/") + "/system_stats", timeout=3)
+        resp = requests.get(base_url.rstrip("/") + "/system_stats", timeout=(1, 5))
         return resp.status_code == 200
     except (requests.ConnectionError, requests.Timeout):
         return False

@@ -28,9 +28,12 @@ class ComfyUIClient(AbstractSDClient):
         """检查 ComfyUI 是否在线，若不在线且提供了安装路径则自动启动。"""
         import requests
         try:
-            r = requests.get(f"{self.base_url}/system_stats", timeout=5)
+            # 启动初期 /system_stats 可能响应较慢，使用更宽容的 10 秒超时
+            r = requests.get(f"{self.base_url}/system_stats", timeout=(3, 10))
             if r.status_code == 200:
                 return True
+        except requests.exceptions.ReadTimeout:
+            log.debug("ComfyUI at %s connected but response read timed out", self.base_url)
         except Exception:
             log.debug("ComfyUI not responding at %s (may not be running)", self.base_url)
 
@@ -75,36 +78,21 @@ class ComfyUIClient(AbstractSDClient):
             if node_id in workflow:
                 workflow[node_id]["inputs"].update(params)
 
+        # 应用用户从面板选择的本地模型覆盖
+        for node_id, params in getattr(config, "model_overrides", {}).items():
+            if node_id in workflow:
+                workflow[node_id]["inputs"].update(params)
+                log.debug("Applied model override node %s: %s", node_id, params)
+
         # Debug: log actual prompt injected into ComfyUI
         node4_text = workflow.get("4", {}).get("inputs", {}).get("text", "")
         log.debug("Node 4 prompt length: %d", len(node4_text))
         log.debug("Node 4 prompt preview: %s", node4_text[:300])
 
-        # CHORD ResizeAndPadImage 尺寸（Node 11）
-        # 快速模式：输入来自 Node 21（Z-Image 1024² → ImageScale 1024²），CHORD 跑 1024²
-        # 高质量模式：输入来自 SeedVR2（2048²），CHORD 跑 2048²
+        # CHORD ResizeAndPadImage 尺寸（Node 11）：固定 2048²
         if "11" in workflow:
-            if getattr(config, "fast_mode", False):
-                workflow["11"]["inputs"]["target_width"] = 1024
-                workflow["11"]["inputs"]["target_height"] = 1024
-            else:
-                workflow["11"]["inputs"]["target_width"] = 2048
-                workflow["11"]["inputs"]["target_height"] = 2048
-
-        # 快速模式：跳过 SeedVR2 + Flux-Fill 整条重链，直接把 Z-Image 1024²
-        # 输出接入 CHORD，节省大量显存和计算。适合低显存卡或追求速度。
-        if getattr(config, "fast_mode", False):
-            # 改接 CHORD 输入
-            if "11" in workflow:
-                workflow["11"]["inputs"]["image"] = ["21", 0]
-            # 移除不需要的节点，防止 ComfyUI 仍加载它们
-            _skip = {
-                "34","35","36","39","40","41","43","44","45","46","47",
-                "51","58","59","60","61","62","63","65","66","67","71",
-                "72","73","74","75","77",
-            }
-            for nid in _skip:
-                workflow.pop(nid, None)
+            workflow["11"]["inputs"]["target_width"] = 2048
+            workflow["11"]["inputs"]["target_height"] = 2048
 
         # img2img: 注入 LoadImage + VAEEncode，把参考图编码后接入 KSampler
         if config.init_image is not None:
@@ -143,6 +131,7 @@ class ComfyUIClient(AbstractSDClient):
         diffuse_image: Image.Image,
         width: int = 2048,
         height: int = 2048,
+        model_name: str = "",
     ) -> GenerationResult:
         """上传 diffuse 贴图并执行 CHORD-only 工作流，返回高质量 PBR maps。
 
@@ -150,6 +139,7 @@ class ComfyUIClient(AbstractSDClient):
             diffuse_image: API 生成的 diffuse 贴图 (PIL Image)
             width: 输出贴图宽度（覆盖 workflow 中 Node 11 的 target_width）
             height: 输出贴图高度（覆盖 workflow 中 Node 11 的 target_height）
+            model_name: 可选。覆盖 CHORD 主模型文件名
 
         Returns:
             GenerationResult with pbr_maps containing basecolor/normal/roughness/metalness/height
@@ -172,7 +162,12 @@ class ComfyUIClient(AbstractSDClient):
             workflow["11"]["inputs"]["target_width"] = width
             workflow["11"]["inputs"]["target_height"] = height
 
-        # 5. 执行工作流
+        # 5. 应用用户选择的 CHORD 模型
+        if model_name and "12" in workflow:
+            workflow["12"]["inputs"]["ckpt_name"] = model_name
+            log.debug("CHORD-only workflow model override: %s", model_name)
+
+        # 6. 执行工作流
         return self._execute_workflow(workflow, output_mode="by_prefix")
 
     def _build_zimage_overrides(self, config: GenerationConfig) -> Dict[str, Dict]:
@@ -227,7 +222,7 @@ class ComfyUIClient(AbstractSDClient):
         resp.raise_for_status()
         return resp.json().get("name", f"{name}.png")
 
-    def _execute_workflow(self, workflow: dict, output_mode: str = "flat") -> GenerationResult:
+    def _execute_workflow(self, workflow: dict, output_mode: str = "flat", require_images: bool = True) -> GenerationResult:
         import requests
         import websocket
         client_id = str(uuid.uuid4())
@@ -306,7 +301,7 @@ class ComfyUIClient(AbstractSDClient):
             log.debug("pbr_maps keys: %s", list(pbr_maps.keys()))
             log.debug("Total images fetched: %d", len(images))
 
-            if not images:
+            if not images and require_images:
                 # 尝试从 history 中提取具体错误信息
                 status_info = history.get(prompt_id, {}).get("status", {})
                 error_msgs = []

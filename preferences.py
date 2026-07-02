@@ -40,6 +40,13 @@ class AIAPIModelItem(bpy.types.PropertyGroup):
     )
 
 
+class AIComfyUIModelItem(bpy.types.PropertyGroup):
+    """本地 ComfyUI 中扫描到的模型文件缓存项。"""
+    model_id: bpy.props.StringProperty(name="模型 ID")
+    label: bpy.props.StringProperty(name="标签")
+    model_kind: bpy.props.StringProperty(name="类型")
+
+
 class AIAPIProviderItem(bpy.types.PropertyGroup):
     provider_id: bpy.props.StringProperty(name="Provider ID")
     name: bpy.props.StringProperty(name="名称", default="自定义 API")
@@ -239,7 +246,7 @@ def get_selected_api_provider_snapshot(context, provider_value: str, image_model
 class AI_OT_TestProviderConnection(bpy.types.Operator):
     bl_idname = "ai_concept.test_provider_connection"
     bl_label = "测试连接"
-    bl_description = "测试选中的图像后端连接状态"
+    bl_description = "测试本地 ComfyUI 是否安装正确，或远程后端是否可连接"
     bl_options = {'REGISTER', 'INTERNAL'}
 
     provider: bpy.props.StringProperty(default='COMFYUI')
@@ -253,10 +260,32 @@ class AI_OT_TestProviderConnection(bpy.types.Operator):
         try:
             if self.provider == 'COMFYUI':
                 url = prefs.comfyui_url.rstrip("/")
-                resp = requests.get(f"{url}/system_stats", timeout=5)
-                resp.raise_for_status()
-                self.report({'INFO'}, f"ComfyUI 已连接: {url}")
-                return {'FINISHED'}
+                install_path = prefs.comfyui_path or comfyui_installer.get_default_install_path()
+                ctype = comfyui_installer.get_comfyui_type(install_path)
+
+                # 本地已安装：尝试直接启动并验证连接
+                if ctype:
+                    from .sd_backend.comfyui_client import ComfyUIClient
+                    self.report({'INFO'}, f"正在测试 ComfyUI {ctype} 连接，必要时将自动启动...")
+                    client = ComfyUIClient(base_url=url)
+                    if client.check_health(auto_launch_path=install_path):
+                        self.report({'INFO'}, f"ComfyUI 连接正常 ({ctype}): {url}")
+                        return {'FINISHED'}
+                    self.report({'ERROR'}, f"ComfyUI {ctype} 启动或连接失败，请检查安装与日志: {install_path}")
+                    return {'CANCELLED'}
+
+                # 本地未安装时，探测 URL 是否已有运行实例
+                try:
+                    resp = requests.get(f"{url}/system_stats", timeout=(3, 10))
+                    resp.raise_for_status()
+                    self.report({'INFO'}, f"ComfyUI 运行中: {url}")
+                    return {'FINISHED'}
+                except requests.exceptions.ReadTimeout:
+                    self.report({'WARNING'}, f"{url} 已连接但响应读取超时，ComfyUI 可能正在初始化，请稍后再试")
+                    return {'CANCELLED'}
+                except Exception as e:
+                    self.report({'ERROR'}, f"未检测到 ComfyUI 安装，且 {url} 无法连接: {e}")
+                    return {'CANCELLED'}
 
             if is_api_provider_value(self.provider):
                 ensure_default_api_providers(prefs)
@@ -622,11 +651,44 @@ class AI_OT_FetchModels(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class AI_OT_RefreshComfyUIModels(bpy.types.Operator):
+    """扫描本地 ComfyUI 的 models 目录，刷新可用模型缓存。"""
+    bl_idname = "ai_concept.refresh_comfyui_models"
+    bl_label = "刷新本地模型"
+    bl_description = "扫描 ComfyUI/models 目录，更新本地模型下拉列表"
+    bl_options = {'REGISTER', 'INTERNAL'}
+
+    def execute(self, context):
+        addon_pkg = __package__.split('.')[0]
+        prefs = context.preferences.addons[addon_pkg].preferences
+        install_path = prefs.comfyui_path or comfyui_installer.get_default_install_path()
+
+        prefs.comfyui_models.clear()
+        scanned = comfyui_installer.scan_comfyui_models(install_path)
+        total = 0
+        for subdir, files in sorted(scanned.items()):
+            for filename in files:
+                item = prefs.comfyui_models.add()
+                item.model_id = filename
+                item.label = filename
+                item.model_kind = subdir
+                total += 1
+
+        self.report({'INFO'}, f"已扫描到 {total} 个本地模型")
+        context.preferences.is_dirty = True
+        for window in context.window_manager.windows:
+            for area in window.screen.areas:
+                area.tag_redraw()
+        return {'FINISHED'}
+
+
 class CTAddonPreferences(bpy.types.AddonPreferences):
     bl_idname = __package__
 
     api_providers: bpy.props.CollectionProperty(type=AIAPIProviderItem)
     active_api_provider_index: bpy.props.IntProperty(name="当前 API Provider", default=0)
+
+    comfyui_models: bpy.props.CollectionProperty(type=AIComfyUIModelItem)
 
     comfyui_url: bpy.props.StringProperty(
         name="ComfyUI 地址",
@@ -722,11 +784,12 @@ class CTAddonPreferences(bpy.types.AddonPreferences):
         install_path = self.comfyui_path or comfyui_installer.get_default_install_path()
         installed = comfyui_installer.is_comfyui_installed(install_path)
 
-        if sys.platform != 'win32' and not installed:
+        ctype = comfyui_installer.get_comfyui_type(install_path)
+        if sys.platform != 'win32' and ctype != "desktop" and not installed:
             warn_box = layout.box()
             warn_box.alert = True
             warn_box.label(
-                text="本地 ComfyUI 自动安装/启动仅支持 Windows；macOS/Linux 请手动配置 ComfyUI",
+                text="本地 ComfyUI 自动安装仅支持 Windows 便携版；macOS/Linux 或桌面版请手动启动 ComfyUI",
                 icon='ERROR',
             )
 
@@ -743,8 +806,8 @@ class CTAddonPreferences(bpy.types.AddonPreferences):
             row = box.row()
             row.operator("ai_concept.install_comfyui", text="自动下载安装", icon='IMPORT')
 
-        # 仅安装完成且指定了路径时才显示测试与 ControlNet Tile 配置
-        if installed and self.comfyui_path:
+        # 安装完成后即显示测试与 ControlNet Tile 配置（允许使用默认路径）
+        if installed:
             row = box.row(align=True)
             op = row.operator("ai_concept.test_provider_connection", text="测试", icon='CHECKMARK')
             op.provider = 'COMFYUI'
@@ -757,6 +820,9 @@ class CTAddonPreferences(bpy.types.AddonPreferences):
             model_box.prop(self, "use_china_mirror")
             model_box.prop(self, "huggingface_token")
             model_box.label(text="公开模型可直接下载；gated 模型需填 HuggingFace Token 或手动下载")
+            row = model_box.row(align=True)
+            row.operator("ai_concept.refresh_comfyui_models", text="刷新本地模型列表", icon='FILE_REFRESH')
+            row.label(text=f"已缓存 {len(self.comfyui_models)} 个模型", icon='INFO')
             for model in comfyui_installer.get_model_registry():
                 actual_path = comfyui_installer.find_model_file(install_path, model)
                 is_installed = actual_path is not None
@@ -829,6 +895,7 @@ class CTAddonPreferences(bpy.types.AddonPreferences):
 
 
 classes = [
+    AIComfyUIModelItem,
     AIAPIModelItem,
     AIAPIProviderItem,
     CTAddonPreferences,
@@ -836,6 +903,7 @@ classes = [
     AI_OT_AddAPIProvider,
     AI_OT_RemoveAPIProvider,
     AI_OT_FetchModels,
+    AI_OT_RefreshComfyUIModels,
 ]
 
 

@@ -253,7 +253,7 @@ def _basic_seamless(arr: np.ndarray, blend_ratio: float = 0.125) -> np.ndarray:
     mask_v = make_mask("v")
     blended_v = blended_h * (1.0 - mask_v) + shifted_v * mask_v
 
-    return np.clip(blended_v, 0.0, 1.0)
+    return _force_seamless_edges(np.clip(blended_v, 0.0, 1.0), band=1)
 
 
 # =============================================================================
@@ -354,9 +354,11 @@ def _remove_macro_gradient(arr: np.ndarray, overlap_ratio: float) -> np.ndarray:
     return np.clip(arr, 0.0, 1.0)
 
 
-def _stitch_horizontal(img: np.ndarray, overlap_w: int, beta: float) -> np.ndarray:
-    """水平方向接缝缝合。"""
+def _stitch_horizontal_inplace(img: np.ndarray, overlap_w: int, beta: float) -> np.ndarray:
+    """水平方向接缝缝合（保持图像尺寸不变）。"""
     h, w, c = img.shape
+    if overlap_w <= 0 or overlap_w >= w // 2:
+        return img.copy()
     right = img[:, -overlap_w:, :].astype(np.float32)
     left = img[:, :overlap_w, :].astype(np.float32)
 
@@ -372,31 +374,72 @@ def _stitch_horizontal(img: np.ndarray, overlap_w: int, beta: float) -> np.ndarr
         hard_mask[y, :seam[y]] = 1.0
 
     blended = _two_band_blend(left, right_matched, hard_mask)
-    middle = img[:, overlap_w:-overlap_w, :]
-    return np.concatenate([middle, blended], axis=1)
+    result = img.copy().astype(np.float32)
+    # 让左右边缘都等于融合后的结果，保证左右连续
+    result[:, :overlap_w, :] = blended
+    result[:, -overlap_w:, :] = blended
+    return result
 
 
-def _stitch_vertical(img: np.ndarray, overlap_h: int, beta: float) -> np.ndarray:
-    """垂直方向接缝缝合（转置复用水平逻辑）。"""
+def _stitch_vertical_inplace(img: np.ndarray, overlap_h: int, beta: float) -> np.ndarray:
+    """垂直方向接缝缝合（保持图像尺寸不变，转置复用水平逻辑）。"""
     transposed = np.transpose(img, (1, 0, 2))
-    stitched = _stitch_horizontal(transposed, overlap_h, beta)
+    stitched = _stitch_horizontal_inplace(transposed, overlap_h, beta)
     return np.transpose(stitched, (1, 0, 2))
 
 
-def _advanced_seamless(arr: np.ndarray, overlap_ratio: float = 0.2, beta: float = 5.0) -> np.ndarray:
-    """高级无缝化：梯度补偿 + 接缝缝合 + 双频融合。"""
+def _force_seamless_edges(arr: np.ndarray, band: int = 2) -> np.ndarray:
+    """强制让左右边缘、上下边缘完全镜像对称，消除残余接缝。
+
+    只对最边缘的 band 个像素做平均，band 很小（默认 2）时对主体内容影响极小。
+    """
+    if band <= 0:
+        return arr
     h, w = arr.shape[:2]
-    ow = int(w * overlap_ratio)
-    oh = int(h * overlap_ratio)
+    band = min(band, w // 2, h // 2)
+    result = arr.copy().astype(np.float32)
 
-    corrected = _remove_macro_gradient(arr, overlap_ratio)
-    after_h = _stitch_horizontal(corrected, ow, beta)
-    after_v = _stitch_vertical(after_h, oh, beta)
+    # 左右边缘对称
+    avg_h = (result[:, :band, :] + result[:, -band:, :][:, ::-1, :]) * 0.5
+    result[:, :band, :] = avg_h
+    result[:, -band:, :] = avg_h[:, ::-1, :]
 
-    rh, rw = after_v.shape[:2]
-    if rh != h or rw != w:
-        after_v = _resize_float_array(after_v, w, h)
-    return np.clip(after_v, 0.0, 1.0)
+    # 上下边缘对称
+    avg_v = (result[:band, :, :] + result[-band:, :, :][::-1, :, :]) * 0.5
+    result[:band, :, :] = avg_v
+    result[-band:, :, :] = avg_v[::-1, :, :]
+
+    return np.clip(result, 0.0, 1.0)
+
+
+def _advanced_seamless(arr: np.ndarray, overlap_ratio: float = 0.2, beta: float = 5.0) -> np.ndarray:
+    """高级无缝化：循环偏移 + 双频融合 + 边缘对称修正。
+
+    思路：把原图与它自身在水平/垂直方向循环偏移半个周期的版本进行多频段融合，
+    使结果在四个边缘都周期连续，同时尽量保留高频细节。
+    """
+    h, w = arr.shape[:2]
+    band_w = max(2, min(int(w * overlap_ratio), w // 2))
+    band_h = max(2, min(int(h * overlap_ratio), h // 2))
+
+    # 水平方向：原图 vs 水平偏移 w//2
+    shifted_h = _roll_image(arr.copy(), -w // 2, 0)
+    mask_h = np.zeros((h, w, 1), dtype=np.float32)
+    ramp_w = np.linspace(0.0, 1.0, band_w, dtype=np.float32).reshape(1, band_w, 1)
+    mask_h[:, :band_w] = ramp_w
+    mask_h[:, -band_w:] = ramp_w[:, ::-1, :]
+    horizontal = _two_band_blend(arr, shifted_h, mask_h)
+
+    # 垂直方向：在水平结果基础上，与垂直偏移 h//2 的版本融合
+    shifted_v = _roll_image(horizontal, 0, -h // 2)
+    mask_v = np.zeros((h, w, 1), dtype=np.float32)
+    ramp_h = np.linspace(0.0, 1.0, band_h, dtype=np.float32).reshape(band_h, 1, 1)
+    mask_v[:band_h, :] = ramp_h
+    mask_v[-band_h:, :] = ramp_h[::-1, :, :]
+    result = _two_band_blend(horizontal, shifted_v, mask_v)
+
+    # 最后强制边缘完全对称，消除任何残余接缝
+    return _force_seamless_edges(result, band=min(2, band_w, band_h))
 
 
 # =============================================================================

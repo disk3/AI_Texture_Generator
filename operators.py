@@ -10,6 +10,7 @@ from .ui import preview_manager
 from .sd_backend import comfyui_installer
 from .utils.logger import get_logger
 from . import preferences as pref_utils
+from .properties import build_texture_prompt
 
 log = get_logger(__name__)
 
@@ -234,6 +235,11 @@ class AI_OT_OptimizePrompt(bpy.types.Operator):
     bl_description = "使用 LLM 将当前提示词优化为更详细的图像生成描述"
     bl_options = {'REGISTER', 'UNDO'}
 
+    def _local_fallback_optimize(self, props):
+        """没有可用 API 时，使用材质配置规则扩展提示词。"""
+        expanded = build_texture_prompt(props)
+        props.prompt = expanded
+
     def execute(self, context):
         props = context.scene.ai_concept_props
         addon_name = __package__.split('.')[0]
@@ -254,13 +260,20 @@ class AI_OT_OptimizePrompt(bpy.types.Operator):
             provider_snapshot = pref_utils.find_any_configured_api_provider(prefs, context)
 
         if not provider_snapshot or not provider_snapshot.get("api_key"):
-            provider_name = provider_snapshot.get("name") if provider_snapshot else "未选中"
-            self.report(
-                {'ERROR'},
-                f"未找到可用 API Key (当前 provider: {provider_name})。"
-                f"请确认 Preferences > AI Texture to PBR 中对应 provider 的 API Key 已填写并保存"
-            )
-            return {'CANCELLED'}
+            # 无可用 API：回退到本地基于 Material Config 的规则扩展
+            try:
+                self._local_fallback_optimize(props)
+                self.report(
+                    {'INFO'},
+                    "未配置 API，已使用本地规则根据材质配置扩展提示词"
+                )
+            except Exception as e:
+                self.report(
+                    {'ERROR'},
+                    f"未找到可用 API Key，且本地规则扩展失败: {e}"
+                )
+                return {'CANCELLED'}
+            return {'FINISHED'}
 
         api_key = provider_snapshot["api_key"]
         base_url = (provider_snapshot.get("base_url") or "").rstrip("/")
@@ -295,7 +308,7 @@ class AI_OT_OptimizePrompt(bpy.types.Operator):
         import requests
         try:
             if protocol == 'GEMINI':
-                # SECURITY: Gemini API 要求通过 URL query param 传递 API Key。
+                # SECURITY: Gemini API Key 要求通过 URL query param 传递 API Key。
                 # Key 可能被中间代理 / CDN / 服务端日志记录。
                 # 建议使用专属的低权限 Key，勿与高价值服务共用同一 Key。
                 gemini_base = base_url if base_url.endswith("/v1beta") else f"{base_url}/v1beta"
@@ -352,7 +365,6 @@ class AI_OT_OptimizePrompt(bpy.types.Operator):
             self.report({'ERROR'}, f"优化失败: {e}")
 
         return {'FINISHED'}
-
 
 class AI_OT_OpenImageFolder(bpy.types.Operator):
     """在文件浏览器中打开贴图所在文件夹。"""
@@ -577,6 +589,8 @@ class AI_OT_ChannelPackRebuild(bpy.types.Operator):
         )
 
         rgba = packed_pil.convert('RGBA')
+        # Blender pixels 原点在左下角，PIL 原点在左上角，需垂直翻转才能一致
+        rgba = rgba.transpose(Image.FLIP_TOP_BOTTOM)
         pixels = list(rgba.getdata())
         flat = [float(c) / 255.0 for px in pixels for c in px]
         packed_blender.pixels.foreach_set(flat)
@@ -846,7 +860,11 @@ class AI_OT_CaptionReferenceImage(bpy.types.Operator):
 
         provider_snapshot = self._get_provider_snapshot(context, prefs)
         if not provider_snapshot or not provider_snapshot.get("api_key"):
-            self.report({'ERROR'}, "请先在 Preferences > AI Texture to PBR 中配置至少一个 API Provider")
+            self.report(
+                {'ERROR'},
+                "反推提示词需要视觉模型 API。请在 Preferences 中配置 API Provider，"
+                "或本地运行 Ollama（OpenAI 兼容端点 http://localhost:11434/v1）后添加为 Provider"
+            )
             return {'CANCELLED'}
 
         api_key = provider_snapshot["api_key"]

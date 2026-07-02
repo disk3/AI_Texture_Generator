@@ -1,7 +1,7 @@
 bl_info = {
     "name": "AI 材质生成",
     "author": "Xiong Meng Han",
-    "version": (1, 1, 1),
+    "version": (1, 1, 2),
     "blender": (3, 6, 0),
     "location": "3D 视图 > 侧边栏 (N) > AI 材质",
     "description": "从提示词或参考图一键生成 PBR 材质贴图（支持本地 ComfyUI 与在线 API）",

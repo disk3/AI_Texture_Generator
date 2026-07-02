@@ -80,7 +80,10 @@ class PBRGenerator:
         if pil_img.mode != 'RGBA':
             pil_img = pil_img.convert('RGBA')
         blender_img = bpy.data.images.new(name, width=pil_img.size[0], height=pil_img.size[1])
-        pixels = list(pil_img.resize((blender_img.size[0], blender_img.size[1])).getdata())
+        resized = pil_img.resize((blender_img.size[0], blender_img.size[1]))
+        # Blender pixels 原点在左下角，PIL 原点在左上角，需垂直翻转才能一致
+        resized = resized.transpose(Image.FLIP_TOP_BOTTOM)
+        pixels = list(resized.getdata())
         blender_img.pixels = [c / 255.0 for px in pixels for c in px]
         # 明确指定为 sRGB，避免 3D 视口因线性/非线性解释错误而发灰
         blender_img.colorspace_settings.name = 'sRGB'

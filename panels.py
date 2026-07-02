@@ -28,16 +28,17 @@ def _addon_prefs(context):
 
 def _provider_status(prefs, provider):
     if provider == 'LOCAL_COMFYUI':
-        if os.name != "nt":
-            return "本地 ComfyUI 自动安装/启动仅支持 Windows，请手动配置 ComfyUI", 'ERROR'
         if not prefs.comfyui_url:
             return "请在偏好设置中填写 ComfyUI 地址", 'ERROR'
         install_path = prefs.comfyui_path or comfyui_installer.get_default_install_path()
-        if not comfyui_installer.is_comfyui_installed(install_path):
+        ctype = comfyui_installer.get_comfyui_type(install_path)
+        if ctype is None:
             return "ComfyUI 未安装，请在偏好设置中安装", 'ERROR'
+        if ctype == "desktop":
+            return "ComfyUI 桌面版已配置，请确保已手动启动", 'CHECKMARK'
         if prefs.comfyui_path:
-            return "ComfyUI 已配置，自动启动已启用", 'CHECKMARK'
-        return "ComfyUI 已安装，自动启动已启用", 'CHECKMARK'
+            return "ComfyUI 便携版已配置，自动启动已启用", 'CHECKMARK'
+        return "ComfyUI 便携版已安装，自动启动已启用", 'CHECKMARK'
 
     if preferences.is_api_provider_value(provider):
         api_provider = preferences.find_api_provider(prefs, preferences.provider_id_from_value(provider))
@@ -79,6 +80,11 @@ def _draw_generation_backend(box, props, prefs):
 
     status_text, status_icon = _provider_status(prefs, provider)
     box.label(text=status_text, icon=status_icon)
+
+    if provider == 'LOCAL_COMFYUI':
+        row = box.row(align=True)
+        row.prop(props, "local_comfyui_model", text="主模型")
+        row.operator("ai_concept.refresh_comfyui_models", text="", icon='FILE_REFRESH')
 
     if preferences.is_api_provider_value(provider):
         _draw_api_model_selector(box, props, prefs, provider)
@@ -159,13 +165,16 @@ class AI_PT_TexturePanel(bpy.types.Panel):
         row = box.row(align=True)
         row.prop(props, "width", text="宽")
         row.prop(props, "height", text="高")
-        install_path = prefs.comfyui_path or comfyui_installer.get_default_install_path()
-        if comfyui_installer.is_comfyui_installed(install_path):
+        # 种子只在 LOCAL_COMFYUI 后端下有意义
+        if props.texture_generator == 'LOCAL_COMFYUI':
             row = box.row(align=True)
             row.prop(props, "seed", text="种子")
-            row.prop(props, "fast_mode", text="快速模式")
+
+        # 本地离线 PBR 烘焙开关：只要检测到本地 ComfyUI 就绪就显示
+        # 这样即使使用 API 后端，也可以选择跳过 CHORD、用本地算法生成 PBR
+        if _is_local_comfyui_ready(prefs):
             row = box.row(align=True)
-            row.prop(props, "use_local_pbr", text="不用 ComfyUI，本地生成 PBR")
+            row.prop(props, "use_local_pbr", text="本地离线 PBR 烘焙")
 
         # 本地 PBR 法线参数（紧接在「不用 ComfyUI」开关下方）
         show_local_normal = props.use_local_pbr

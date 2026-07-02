@@ -63,6 +63,18 @@ class GenerationOrchestrator:
             return client.check_health(auto_launch_path=auto_launch_path)
         return client.check_health()
 
+    @staticmethod
+    def _is_comfyui_url_reachable(url: str) -> bool:
+        """快速探测 ComfyUI URL 是否可达。"""
+        if not url:
+            return False
+        try:
+            import requests
+            r = requests.get(url.rstrip('/') + '/system_stats', timeout=3)
+            return r.status_code == 200
+        except Exception:
+            return False
+
     def start_generation(self, context, cancel_event: threading.Event):
         self._cancel_event = cancel_event
 
@@ -72,10 +84,13 @@ class GenerationOrchestrator:
         texture_generator = getattr(props, "texture_generator", "LOCAL_COMFYUI")
 
         # 选择 Local ComfyUI 但未安装时，弹出安装确认对话框。
-        # 例外：参考图模式 + 无用户 prompt + 启用本地 PBR 时，可直接处理原图，无需 ComfyUI。
+        # 例外 1：参考图模式 + 无用户 prompt + 启用本地 PBR 时，可直接处理原图，无需 ComfyUI。
+        # 例外 2：用户已填写可访问的 ComfyUI URL（桌面版/手动启动）时也跳过安装提示。
         if texture_generator == 'LOCAL_COMFYUI':
             install_path = prefs.comfyui_path or comfyui_installer.get_default_install_path()
-            if not comfyui_installer.is_comfyui_installed(install_path):
+            installed = comfyui_installer.is_comfyui_installed(install_path)
+            url_reachable = self._is_comfyui_url_reachable(prefs.comfyui_url)
+            if not installed and not url_reachable:
                 has_reference = getattr(props, 'reference_image', None) is not None
                 has_prompt = bool(props.prompt.strip())
                 use_local_pbr = getattr(props, "use_local_pbr", False)
@@ -165,7 +180,6 @@ class GenerationOrchestrator:
             batch_size=props.batch_size,
             reference_tile_strength=getattr(props, "reference_tile_strength", 0.5),
             use_chord_enhanced=True,
-            fast_mode=getattr(props, "fast_mode", False),
         )
 
         # 参考图处理
@@ -257,7 +271,6 @@ class GenerationOrchestrator:
             "output_roughness": props.output_roughness,
             "output_metalness": props.output_metalness,
             "output_height": props.output_height,
-            "fast_mode": getattr(props, "fast_mode", False),
         }
 
         # 将用户本地 PBR 开关传递给后台线程
@@ -265,6 +278,7 @@ class GenerationOrchestrator:
         data["normal_strength"] = getattr(props, "normal_strength", 1.5)
         data["normal_detail"] = getattr(props, "normal_detail", 0.4)
         data["normal_invert"] = getattr(props, "normal_invert", False)
+        data["local_comfyui_model"] = getattr(props, "local_comfyui_model", "DEFAULT")
 
         self._thread = threading.Thread(
             target=self._generate_worker,
@@ -583,6 +597,12 @@ class GenerationOrchestrator:
                 "message": "正在 ComfyUI 中运行 Zimage+CHORD 工作流...",
             })
 
+            # 注入用户选择的本地 ComfyUI 主模型（Z-Image Turbo / UNETLoader node 1）
+            selected_model = data.get("local_comfyui_model", "DEFAULT")
+            if selected_model and selected_model not in ("DEFAULT", "__EMPTY__"):
+                base_config.model_overrides["1"] = {"unet_name": selected_model}
+                log.debug("Override main UNET model to %s", selected_model)
+
             result = client.execute_workflow_json(base_config)
             client.set_progress_callback(None)
             pbr_maps = result.pbr_maps
@@ -733,14 +753,12 @@ class GenerationOrchestrator:
 
             textures = filtered_textures
 
-            # 快速模式或启用本地 PBR 时：用本地算法做无缝平铺
-            if data.get("fast_mode", False) or data.get("use_local_pbr", False):
-                method = "ADVANCED" if data.get("use_local_pbr", False) else "BASIC"
+            # 启用本地 PBR 时：用本地算法做无缝平铺
+            if data.get("use_local_pbr", False):
                 for k in textures:
-                    textures[k] = make_seamless_tile_iem(textures[k], method=method)
+                    textures[k] = make_seamless_tile_iem(textures[k], method="ADVANCED")
 
             # 将贴图缩放到用户选择的输出尺寸
-            # 快速模式生成于 1024²，高质量模式生成于 2048²，用户可能选了 512/1024/2048/4096
             target_w = int(data["config"].width)
             target_h = int(data["config"].height)
             for k in textures:
@@ -770,6 +788,8 @@ class GenerationOrchestrator:
                 if pil_img.mode != 'RGBA':
                     pil_img = pil_img.convert('RGBA')
                 resized = pil_img.resize((blender_img.size[0], blender_img.size[1]))
+                # Blender pixels 原点在左下角，PIL 原点在左上角，需垂直翻转才能一致
+                resized = resized.transpose(Image.FLIP_TOP_BOTTOM)
                 pixels = list(resized.getdata())
                 flat = [float(c) / 255.0 for px in pixels for c in px]
                 blender_img.pixels.foreach_set(flat)
