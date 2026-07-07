@@ -27,8 +27,9 @@
 
 1. 安装插件：Blender → Edit → Preferences → Add-ons → Install → 选择 ZIP
 2. 启用 **AI Texture to PBR**
-3. 在 Preferences 中配置 API Provider（OpenAI / ModelScope / Gemini / 自定义兼容端点）
-4. 点击面板上的 **Generate PBR Maps**
+3. 如果面板提示基础组件缺失，点击 **一键修复基础组件**，完成后重新启用插件或重启 Blender
+4. 在 Preferences 中配置 API Provider（OpenAI / ModelScope / Gemini / 自定义兼容端点）
+5. 点击面板上的 **Generate PBR Maps**
 
 ### 方式二：使用本地 ComfyUI
 
@@ -78,6 +79,17 @@
 - ⚠️ **安全提醒**：Gemini API 官方要求通过 URL 查询参数 `?key=` 传递 API Key（非 HTTP Header）。这意味着 Key 可能被中间代理、CDN 或服务端日志记录。建议使用专属的低权限 Key，勿与高价值服务共用同一 Key。
 
 点击每个 Provider 的 **Fetch Models** 按钮自动拉取可用模型列表。
+
+## 组件与一键修复
+
+插件会尽量使用 Blender 自带能力和 Python 标准库运行。`Pillow`、`requests`、
+`websocket-client` 属于增强组件：
+
+- `Pillow`：剪贴板与图片解码增强；缺失时部分路径会回退到 Blender 主线程解码
+- `requests`：HTTP 兼容性增强；缺失时 API/ComfyUI 会尝试使用标准库 fallback
+- `websocket-client`：ComfyUI 实时进度；缺失时回退到 HTTP polling
+
+本地 PBR 需要 `numpy`。如果 Blender 环境缺少基础组件，面板会显示 **一键修复基础组件**。
 
 ## 快捷键
 

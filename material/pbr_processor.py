@@ -1,5 +1,21 @@
 import numpy as np
-from PIL import Image
+
+
+def _ensure_hwc_uint8(arr: np.ndarray) -> np.ndarray:
+    """统一转换为 HWC uint8；灰度图扩展为 3 通道。"""
+    arr = np.asarray(arr)
+    if arr.ndim == 2:
+        return np.stack([arr, arr, arr], axis=-1)
+    if arr.ndim == 3 and arr.shape[-1] == 1:
+        return np.repeat(arr, 3, axis=-1)
+    return arr.astype(np.uint8)
+
+
+def _to_grayscale(arr: np.ndarray) -> np.ndarray:
+    """numpy RGB/RGBA → 灰度 (H, W) float32。"""
+    arr = _ensure_hwc_uint8(arr)
+    rgb = arr[..., :3].astype(np.float32)
+    return rgb[..., 0] * 0.299 + rgb[..., 1] * 0.587 + rgb[..., 2] * 0.114
 
 
 # =============================================================================
@@ -76,8 +92,8 @@ def _get_roughness_range(category: str, finish: str) -> tuple:
     )
 
 
-def generate_normal_map(diffuse: Image.Image, strength: float = 0.8) -> Image.Image:
-    """参考 NormalMap-Online 算法生成法线贴图（OpenGL 切线空间格式）。
+def generate_normal_map(diffuse: np.ndarray, strength: float = 0.8) -> np.ndarray:
+    """参考 NormalMap-Online 算法生成法线贴图（OpenGL 切线空间格式），返回 numpy uint8 RGB。
 
     核心算法（对应 NormalMap-Online 默认 Sobel 模式）：
     1. 对灰度图直接做 3x3 Sobel 计算 dx, dy（不预处理模糊，保留细节）
@@ -87,7 +103,7 @@ def generate_normal_map(diffuse: Image.Image, strength: float = 0.8) -> Image.Im
     """
     try:
         import cv2
-        gray = np.array(diffuse.convert('L'), dtype=np.float32)
+        gray = _to_grayscale(diffuse).astype(np.float32)
         h, w = gray.shape
 
         # Sobel 计算梯度
@@ -114,11 +130,11 @@ def generate_normal_map(diffuse: Image.Image, strength: float = 0.8) -> Image.Im
         # Z 分量已在 [0,1]（normalize 后 Z 始终为正）
 
         normal = np.clip(normal * 255, 0, 255).astype(np.uint8)
-        return Image.fromarray(normal)
+        return normal
 
     except ImportError:
-        # fallback: 简化版 PIL 实现
-        gray = np.array(diffuse.convert('L'), dtype=np.float32)
+        # fallback: 简化版 numpy 实现
+        gray = _to_grayscale(diffuse).astype(np.float32)
         h, w = gray.shape
 
         dx = np.zeros_like(gray)
@@ -140,23 +156,23 @@ def generate_normal_map(diffuse: Image.Image, strength: float = 0.8) -> Image.Im
         normal[:, :, 1] = normal[:, :, 1] * 0.5 + 0.5
 
         normal = np.clip(normal * 255, 0, 255).astype(np.uint8)
-        return Image.fromarray(normal)
+        return normal
 
 
 def generate_roughness_map(
-    diffuse: Image.Image,
+    diffuse: np.ndarray,
     category: str = "",
     finish: str = "",
     contrast: float = 1.0,
-) -> Image.Image:
-    """从 diffuse 生成 roughness 贴图，根据材质物理属性计算基础范围。
+) -> np.ndarray:
+    """从 diffuse（numpy uint8 RGB/RGBA）生成 roughness 贴图（numpy uint8 RGB），根据材质物理属性计算基础范围。
 
     逻辑：
     1. 反转亮度（暗部/裂缝通常更粗糙）
     2. 根据 material_category 和 surface_finish 确定 roughness 的物理范围
     3. 将反转后的亮度映射到该物理范围内
     """
-    gray = np.array(diffuse.convert('L'), dtype=np.float32)
+    gray = _to_grayscale(diffuse).astype(np.float32)
 
     # 反转亮度：暗部 → 更粗糙（高 Roughness）
     inverted = 255.0 - gray
@@ -171,23 +187,24 @@ def generate_roughness_map(
         rough = (rough - midpoint) * contrast + midpoint
     rough = np.clip(rough, r_min, r_max)
 
-    return Image.fromarray(rough.astype(np.uint8), mode='L').convert('RGB')
+    rough_u8 = rough.astype(np.uint8)
+    return np.stack([rough_u8, rough_u8, rough_u8], axis=-1)
 
 
 def generate_metallic_map(
-    diffuse: Image.Image,
+    diffuse: np.ndarray,
     category: str = "",
     finish: str = "",
     threshold: int = 220,
-) -> Image.Image:
-    """从 diffuse 生成 metallic 贴图，根据材质物理属性决定金属度。
+) -> np.ndarray:
+    """从 diffuse（numpy uint8 RGB/RGBA）生成 metallic 贴图（numpy uint8 RGB），根据材质物理属性决定金属度。
 
     逻辑：
     1. 金属类材质（Met）：高亮且低饱和度区域标记为金属
     2. 非金属类材质：几乎不标记金属，除非极端高亮（如釉面反光）
     3. 由 material_category 决定 base metallic 水平
     """
-    arr = np.array(diffuse.convert('RGB'), dtype=np.float32)
+    arr = _ensure_hwc_uint8(diffuse).astype(np.float32)
     max_c = np.max(arr, axis=2)
     min_c = np.min(arr, axis=2)
     brightness = max_c
@@ -209,17 +226,18 @@ def generate_metallic_map(
         metallic[(brightness > max(245, threshold)) & (saturation < 0.03)] = 180
 
     metallic = np.clip(metallic, 0, 255)
-    return Image.fromarray(metallic.astype(np.uint8), mode='L').convert('RGB')
+    metallic_u8 = metallic.astype(np.uint8)
+    return np.stack([metallic_u8, metallic_u8, metallic_u8], axis=-1)
 
 
 def generate_packed_map(
-    roughness: Image.Image,
-    metallic: Image.Image,
+    roughness: np.ndarray,
+    metallic: np.ndarray,
     pack_config: dict,
-    ao: Image.Image = None,
-    height: Image.Image = None,
-) -> Image.Image:
-    """按 pack_config 将贴图打包到 RGBA 通道，生成 Channel Packed 贴图。
+    ao: np.ndarray = None,
+    height: np.ndarray = None,
+) -> np.ndarray:
+    """按 pack_config 将 numpy 贴图打包到 RGBA 通道，生成 Channel Packed 贴图。
 
     pack_config 格式: {'r'|'g'|'b'|'a': 'AO'|'ROUGHNESS'|'METALLIC'|'HEIGHT'|'NONE', ...}
 
@@ -240,8 +258,8 @@ def generate_packed_map(
     Returns:
         RGBA 图像，可直接作为 Channel Packed 贴图使用
     """
-    r_gray = np.array(roughness.convert('L'), dtype=np.uint8)
-    m_gray = np.array(metallic.convert('L'), dtype=np.uint8)
+    r_gray = _to_grayscale(roughness).astype(np.uint8)
+    m_gray = _to_grayscale(metallic).astype(np.uint8)
 
     h, w = r_gray.shape
     packed = np.zeros((h, w, 4), dtype=np.uint8)
@@ -251,9 +269,9 @@ def generate_packed_map(
         'METALLIC': m_gray,
     }
     if ao is not None:
-        image_map['AO'] = np.array(ao.convert('L'), dtype=np.uint8)
+        image_map['AO'] = _to_grayscale(ao).astype(np.uint8)
     if height is not None:
-        image_map['HEIGHT'] = np.array(height.convert('L'), dtype=np.uint8)
+        image_map['HEIGHT'] = _to_grayscale(height).astype(np.uint8)
 
     for ch_name, ch_idx in [('r', 0), ('g', 1), ('b', 2), ('a', 3)]:
         content = pack_config.get(ch_name, 'NONE')
@@ -269,4 +287,4 @@ def generate_packed_map(
             # HEIGHT 未提供时填白
             packed[:, :, ch_idx] = 255
 
-    return Image.fromarray(packed, mode='RGBA')
+    return packed

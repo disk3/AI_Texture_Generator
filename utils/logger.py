@@ -33,7 +33,8 @@ def get_logger(name: str = "blender_ai") -> logging.Logger:
     if name in _loggers:
         return _loggers[name]
 
-    logger = logging.getLogger(name)
+    logger_name = name if name.startswith("blender_ai") else f"blender_ai.{name}"
+    logger = logging.getLogger(logger_name)
     _loggers[name] = logger
     return logger
 

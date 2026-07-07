@@ -107,80 +107,14 @@
     },
     "class_type": "SaveImage"
   },
-  "72": {
-    "inputs": {
-      "model": "ema_vae_fp16.safetensors",
-      "device": "cuda:0",
-      "encode_tiled": true,
-      "encode_tile_size": 1024,
-      "encode_tile_overlap": 128,
-      "decode_tiled": true,
-      "decode_tile_size": 1024,
-      "decode_tile_overlap": 128,
-      "tile_debug": "false",
-      "offload_device": "cpu"
-    },
-    "class_type": "SeedVR2LoadVAEModel"
-  },
-  "73": {
-    "inputs": {
-      "model": "seedvr2_ema_3b_fp16.safetensors",
-      "device": "cuda:0",
-      "blocks_to_swap": 32,
-      "swap_io_components": true,
-      "offload_device": "cpu",
-      "attention_mode": "sdpa"
-    },
-    "class_type": "SeedVR2LoadDiTModel"
-  },
-  "74": {
+  "11": {
     "inputs": {
       "image": [
         "9",
         0
       ],
-      "upscale_method": "lanczos",
-      "scale_by": 0.5000000000000001
-    },
-    "class_type": "ImageScaleBy"
-  },
-  "75": {
-    "inputs": {
-      "image": [
-        "74",
-        0
-      ],
-      "dit": [
-        "73",
-        0
-      ],
-      "vae": [
-        "72",
-        0
-      ],
-      "seed": 2716928955,
-      "resolution": 2048,
-      "max_resolution": 4096,
-      "batch_size": 1,
-      "uniform_batch_size": false,
-      "color_correction": "lab",
-      "temporal_overlap": 0,
-      "prepend_frames": 0,
-      "input_noise_scale": 0,
-      "latent_noise_scale": 0,
-      "offload_device": "cpu",
-      "enable_debug": false
-    },
-    "class_type": "SeedVR2VideoUpscaler"
-  },
-  "11": {
-    "inputs": {
-      "image": [
-        "75",
-        0
-      ],
-      "target_width": 2048,
-      "target_height": 2048,
+      "target_width": 1024,
+      "target_height": 1024,
       "padding_color": "white",
       "interpolation": "lanczos"
     },

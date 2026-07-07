@@ -18,6 +18,7 @@ import tempfile
 import subprocess
 import urllib.request
 import urllib.parse
+import hashlib
 from typing import Callable, Dict, List, Optional, Tuple
 
 from ..utils.logger import get_logger
@@ -32,26 +33,13 @@ log = get_logger(__name__)
 COMFYUI_REPO_OWNER = "comfyanonymous"
 COMFYUI_REPO_NAME = "ComfyUI"
 
-# 必需 custom nodes：仓库地址 -> 目录名
+# 必需 custom nodes：仓库地址 -> 目录名，或 {"folder": "...", "commit": "..."}
 REQUIRED_CUSTOM_NODES = {
     "ubisoft/ComfyUI-Chord": "ComfyUI-Chord",
     "numz/ComfyUI-SeedVR2_VideoUpscaler": "ComfyUI-SeedVR2_VideoUpscaler",
 }
 
 MODEL_REGISTRY: List[Dict] = [
-    {
-        "id": "flux_fill_dev_fp8",
-        "label": "FLUX.1 Fill Dev FP8",
-        "dir": "models/unet",
-        "filename": "flux1-fill-dev-fp8.safetensors",
-        "page": "https://hf-mirror.com/black-forest-labs/FLUX.1-Fill-dev/tree/main",
-        "url": "https://hf-mirror.com/black-forest-labs/FLUX.1-Fill-dev/resolve/main/flux1-fill-dev-fp8.safetensors",
-        "size": "~17 GB",
-        "gated": True,
-        "mirrors": [
-            "https://huggingface.co/black-forest-labs/FLUX.1-Fill-dev/resolve/main/flux1-fill-dev-fp8.safetensors",
-        ],
-    },
     {
         "id": "ae_vae",
         "label": "FLUX VAE (ae.sft)",
@@ -63,32 +51,6 @@ MODEL_REGISTRY: List[Dict] = [
         "gated": True,
         "mirrors": [
             "https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/ae.sft",
-        ],
-    },
-    {
-        "id": "clip_l",
-        "label": "CLIP-L",
-        "dir": "models/clip",
-        "filename": "clip_l.safetensors",
-        "page": "https://hf-mirror.com/comfyanonymous/flux_text_encoders/tree/main",
-        "url": "https://hf-mirror.com/comfyanonymous/flux_text_encoders/resolve/main/clip_l.safetensors",
-        "size": "~200 MB",
-        "gated": False,
-        "mirrors": [
-            "https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/clip_l.safetensors",
-        ],
-    },
-    {
-        "id": "t5xxl_fp8",
-        "label": "T5XXL FP8",
-        "dir": "models/clip",
-        "filename": "t5xxl_fp8_e4m3fn.safetensors",
-        "page": "https://hf-mirror.com/comfyanonymous/flux_text_encoders/tree/main",
-        "url": "https://hf-mirror.com/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp8_e4m3fn.safetensors",
-        "size": "~10 GB",
-        "gated": False,
-        "mirrors": [
-            "https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp8_e4m3fn.safetensors",
         ],
     },
     {
@@ -472,6 +434,14 @@ def _parse_model_size_bytes(size_str: str) -> int:
     return int(value * multipliers.get(unit, 0))
 
 
+def _sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def _check_disk_space(target_path: str, required_bytes: int, progress_cb=None) -> bool:
     """检查目标路径所在磁盘是否有足够空间。空间不足则回调错误并返回 False。"""
     free = _get_free_disk_space(target_path)
@@ -510,11 +480,18 @@ def _download_single_url(url: str, dest_path: str, progress_cb: Optional[Callabl
         headers["Authorization"] = f"Bearer {hf_token}"
 
     req = urllib.request.Request(url, headers=headers)
+    part_path = f"{dest_path}.part"
+    if os.path.isfile(part_path):
+        try:
+            os.remove(part_path)
+        except OSError:
+            log.debug("Failed to remove stale partial download: %s", part_path)
+
     with urllib.request.urlopen(req, timeout=120) as resp:
         total = int(resp.headers.get("Content-Length", 0))
         chunk_size = 1024 * 1024
         downloaded = 0
-        with open(dest_path, "wb") as f:
+        with open(part_path, "wb") as f:
             while True:
                 chunk = resp.read(chunk_size)
                 if not chunk:
@@ -523,10 +500,21 @@ def _download_single_url(url: str, dest_path: str, progress_cb: Optional[Callabl
                 downloaded += len(chunk)
                 if total and progress_cb:
                     progress_cb("download", downloaded / total, f"已下载 {downloaded // 1024 // 1024} MB / {total // 1024 // 1024} MB")
+        if total and downloaded < total:
+            raise RuntimeError(f"下载不完整: {downloaded}/{total} bytes")
+    os.replace(part_path, dest_path)
     return True
 
 
-def _download_with_progress(urls, dest_path: str, progress_cb: Optional[Callable], hf_token: str = "") -> bool:
+def _download_with_progress(
+    urls,
+    dest_path: str,
+    progress_cb: Optional[Callable],
+    hf_token: str = "",
+    expected_size: int = 0,
+    expected_sha256: str = "",
+    skip_existing: bool = True,
+) -> bool:
     """流式下载文件并汇报进度。支持 URL 列表自动 fallback。"""
     if isinstance(urls, str):
         urls = [urls]
@@ -536,11 +524,31 @@ def _download_with_progress(urls, dest_path: str, progress_cb: Optional[Callable
             progress_cb("download", 0.0, "下载失败: 没有可用的下载地址")
         return False
 
-    # 再次确认目标文件不存在，防止路径不一致导致重复下载
-    if os.path.isfile(dest_path):
+    if os.path.isfile(dest_path) and skip_existing:
+        size = os.path.getsize(dest_path)
+        hash_ok = True
+        if expected_sha256:
+            try:
+                hash_ok = _sha256_file(dest_path).lower() == expected_sha256.lower()
+            except Exception:
+                hash_ok = False
+        if (expected_size and size < expected_size * 0.9) or not hash_ok:
+            try:
+                os.remove(dest_path)
+            except OSError:
+                log.debug("Failed to remove incomplete existing file: %s", dest_path)
+        else:
+            if progress_cb:
+                progress_cb("download", 1.0, f"文件已存在，跳过下载: {dest_path}")
+            return True
+
+    if os.path.isfile(dest_path) and not skip_existing:
         if progress_cb:
-            progress_cb("download", 1.0, f"文件已存在，跳过下载: {dest_path}")
-        return True
+            progress_cb("download", 0.0, f"重新下载并覆盖: {dest_path}")
+        try:
+            os.remove(dest_path)
+        except OSError:
+            log.debug("Failed to remove existing file before redownload: %s", dest_path)
 
     last_error = ""
     for idx, url in enumerate(urls):
@@ -552,6 +560,13 @@ def _download_with_progress(urls, dest_path: str, progress_cb: Optional[Callable
 
         try:
             if _download_single_url(url, dest_path, progress_cb, hf_token):
+                if expected_sha256 and _sha256_file(dest_path).lower() != expected_sha256.lower():
+                    try:
+                        os.remove(dest_path)
+                    except OSError:
+                        log.debug("Failed to remove hash-mismatched file: %s", dest_path)
+                    last_error = "SHA256 校验失败"
+                    continue
                 return True
         except urllib.error.HTTPError as e:
             if os.path.isfile(dest_path):
@@ -615,7 +630,7 @@ def install_comfyui_portable(target_path: str, progress_cb: Optional[Callable] =
             progress_cb("download", 0.0, f"准备下载 {version}")
 
         archive_path = os.path.join(tempfile.gettempdir(), f"comfyui_windows_portable_{version}.7z")
-        if not _download_with_progress(url, archive_path, progress_cb):
+        if not _download_with_progress(url, archive_path, progress_cb, skip_existing=False):
             raise RuntimeError("ComfyUI portable 下载失败，请检查网络连接或关闭国内镜像后重试")
 
         if progress_cb:
@@ -679,7 +694,13 @@ def install_custom_nodes(comfyui_path: str, progress_cb: Optional[Callable] = No
         return False
 
     total = len(REQUIRED_CUSTOM_NODES)
-    for idx, (repo, folder_name) in enumerate(REQUIRED_CUSTOM_NODES.items(), 1):
+    for idx, (repo, node_spec) in enumerate(REQUIRED_CUSTOM_NODES.items(), 1):
+        if isinstance(node_spec, dict):
+            folder_name = node_spec.get("folder") or repo.rsplit("/", 1)[-1]
+            pinned_commit = node_spec.get("commit", "")
+        else:
+            folder_name = str(node_spec)
+            pinned_commit = ""
         if progress_cb:
             progress_cb("nodes", idx / total, f"安装节点 {folder_name}...")
 
@@ -700,6 +721,13 @@ def install_custom_nodes(comfyui_path: str, progress_cb: Optional[Callable] = No
             if not clone_ok:
                 if progress_cb:
                     progress_cb("nodes", idx / total, f"git clone {repo} 失败: {last_err}")
+                continue
+
+        if pinned_commit:
+            code, out, err = _run_subprocess(["git", "checkout", pinned_commit], cwd=target)
+            if code != 0:
+                if progress_cb:
+                    progress_cb("nodes", idx / total, f"{folder_name} checkout {pinned_commit} 失败: {err[:200]}")
                 continue
 
         req_file = os.path.join(target, "requirements.txt")
@@ -812,12 +840,19 @@ def download_model(comfyui_path: str, model_id: str, progress_cb: Optional[Calla
     existing_path = find_model_file(comfyui_path, model)
     if existing_path:
         file_size = os.path.getsize(existing_path)
-        if file_size > 0:
+        expected_sha256 = model.get("sha256", "")
+        hash_ok = True
+        if expected_sha256:
+            try:
+                hash_ok = _sha256_file(existing_path).lower() == expected_sha256.lower()
+            except Exception:
+                hash_ok = False
+        if file_size > 0 and (not size_bytes or file_size >= size_bytes * 0.9) and hash_ok:
             if progress_cb:
                 progress_cb("model", 1.0, f"{model['label']} 已存在: {existing_path}")
             return True
         else:
-            # 空文件视为不存在，重新下载
+            # 空文件或明显不完整的文件视为不存在，重新下载
             try:
                 os.remove(existing_path)
             except OSError:
@@ -839,4 +874,11 @@ def download_model(comfyui_path: str, model_id: str, progress_cb: Optional[Calla
         if u and u not in seen:
             seen.add(u)
             unique_urls.append(u)
-    return _download_with_progress(unique_urls, dest_path, progress_cb, hf_token=hf_token)
+    return _download_with_progress(
+        unique_urls,
+        dest_path,
+        progress_cb,
+        hf_token=hf_token,
+        expected_size=size_bytes,
+        expected_sha256=model.get("sha256", ""),
+    )

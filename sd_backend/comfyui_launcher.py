@@ -8,10 +8,32 @@ import re
 import signal
 import subprocess
 import time
+import traceback
 
 from ..utils.logger import get_logger
 
 log = get_logger(__name__)
+
+
+def _read_log_tail(log_path: str, lines: int = 30) -> str:
+    """读取日志文件最后 N 行，用于快速诊断启动失败原因。"""
+    if not os.path.isfile(log_path):
+        return "(no log file)"
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+            all_lines = f.readlines()
+            return "".join(all_lines[-lines:])
+    except Exception as e:
+        return f"(failed to read log: {e})"
+
+
+def _requests_module():
+    try:
+        import requests
+        return requests
+    except ImportError:
+        from ..utils import simple_requests
+        return simple_requests
 
 
 def _find_launch_script(comfyui_path: str) -> str:
@@ -34,11 +56,24 @@ def _find_launch_script(comfyui_path: str) -> str:
 
 
 def _sanitize_auto_launch(args: list) -> list:
-    """过滤掉会导致浏览器自动弹出的 --auto-launch 参数及其变体。"""
+    """过滤掉会导致浏览器自动弹出的 --auto-launch 参数，保留 --disable-auto-launch。"""
     cleaned = []
-    for a in args:
+    skip_next = False
+    for i, a in enumerate(args):
+        if skip_next:
+            skip_next = False
+            continue
         al = a.lower()
-        if al in ("--auto-launch", "--autolaunch") or al.startswith(("--auto-launch=", "--autolaunch=")):
+        # 保留显式禁用 auto-launch 的参数
+        if al in ("--disable-auto-launch", "--disable-autolaunch"):
+            cleaned.append(a)
+            continue
+        if al in ("--auto-launch", "--autolaunch"):
+            # 形如 --auto-launch value 时，跳过后面的值（只要不是下一个参数）
+            if i + 1 < len(args) and not args[i + 1].startswith("-"):
+                skip_next = True
+            continue
+        if al.startswith(("--auto-launch=", "--autolaunch=")):
             continue
         cleaned.append(a)
     return cleaned
@@ -96,9 +131,12 @@ def _build_launch_cmd(comfyui_path: str) -> list:
     if not python_exe:
         return []
 
-    args = [python_exe, "-s", main_py, "--disable-auto-launch"]
+    args = [python_exe, "-s", main_py]
     if ctype == "portable":
         args.append("--windows-standalone-build")
+
+    # 禁止 ComfyUI 启动后自动弹出浏览器
+    args.append("--disable-auto-launch")
 
     # fallback: 从 bat 脚本提取额外参数
     bat = _find_launch_script(comfyui_path)
@@ -122,30 +160,51 @@ def launch_comfyui(comfyui_path: str) -> bool:
 
     cmd = _build_launch_cmd(comfyui_path)
     if not cmd:
+        log.warning("无法为 %s 构建 ComfyUI 启动命令（路径无效或找不到 python）", comfyui_path)
         return False
 
-    # 纯后台运行：无窗口、不阻塞 Blender、不弹浏览器
+    log_path = os.path.join(comfyui_path, "comfyui_launcher.log")
+    log.info("Launching ComfyUI: %s", " ".join(cmd))
+    log.info("ComfyUI stdout/stderr -> %s", log_path)
+
     try:
         cmd = _sanitize_auto_launch(cmd)
+        log_file = open(log_path, "a", encoding="utf-8", errors="ignore")
+        log_file.write(f"\n\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Launch command: {' '.join(cmd)}\n")
+        log_file.flush()
+
         kwargs = {
             "cwd": comfyui_path,
-            "stdout": subprocess.DEVNULL,
-            "stderr": subprocess.DEVNULL,
+            "stdout": log_file,
+            "stderr": subprocess.STDOUT,
         }
         if os.name == "nt":
-            # CREATE_NEW_PROCESS_GROUP 让我们可以用 CTRL_BREAK_EVENT 结束整个进程树
             kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
             si = subprocess.STARTUPINFO()
             si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             si.wShowWindow = subprocess.SW_HIDE
             kwargs["startupinfo"] = si
         else:
-            # Linux/macOS：创建新会话，退出时可直接 killpg 整个进程组
             kwargs["start_new_session"] = True
+
         _comfyui_process = subprocess.Popen(cmd, **kwargs)
+
+        # 给进程 2 秒时间，若已退出则读取日志并提示
+        time.sleep(2)
+        early_code = _comfyui_process.poll()
+        if early_code is not None:
+            log_file.flush()
+            tail = _read_log_tail(log_path, 30)
+            log.warning(
+                "ComfyUI process exited early (return code %d). Last log lines:\n%s",
+                early_code, tail,
+            )
+            _comfyui_process = None
+            return False
+
         return True
     except Exception:
-        log.warning("Failed to launch ComfyUI process")
+        log.warning("Failed to launch ComfyUI process:\n%s", traceback.format_exc())
         return False
 
 
@@ -201,7 +260,7 @@ def _extract_port(base_url: str) -> int:
     return 8188
 
 
-def shutdown_comfyui(base_url: str = ""):
+def shutdown_comfyui(base_url: str = "", force_by_port: bool = False):
     """关闭由本插件自动启动的 ComfyUI 进程及其子进程。"""
     global _comfyui_process
 
@@ -237,13 +296,13 @@ def shutdown_comfyui(base_url: str = ""):
         finally:
             _comfyui_process = None
 
-    # 即使 _comfyui_process 已丢失或无法终止，也按端口清理残留进程
-    _kill_by_port(port)
+    if force_by_port:
+        _kill_by_port(port)
 
 
-def wait_for_comfyui(base_url: str, timeout: int = 120) -> bool:
+def wait_for_comfyui(base_url: str, timeout: int = 120, comfyui_path: str = "") -> bool:
     """轮询等待 ComfyUI 启动成功。"""
-    import requests
+    requests = _requests_module()
     url = base_url.rstrip("/") + "/system_stats"
     for _ in range(timeout):
         try:
@@ -251,18 +310,24 @@ def wait_for_comfyui(base_url: str, timeout: int = 120) -> bool:
             resp = requests.get(url, timeout=(1, 4))
             if resp.status_code == 200:
                 return True
-        except (requests.ConnectionError, requests.Timeout):
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, OSError):
             pass
         time.sleep(1)
-    log.warning("ComfyUI did not start within %ds", timeout)
+
+    log_path = os.path.join(comfyui_path, "comfyui_launcher.log") if comfyui_path else ""
+    tail = _read_log_tail(log_path, 30) if log_path else "(no log path)"
+    log.warning(
+        "ComfyUI did not start within %ds. Last log lines:\n%s",
+        timeout, tail,
+    )
     return False
 
 
 def is_comfyui_running(base_url: str) -> bool:
     """检查 ComfyUI 是否已响应。"""
-    import requests
+    requests = _requests_module()
     try:
         resp = requests.get(base_url.rstrip("/") + "/system_stats", timeout=(1, 5))
         return resp.status_code == 200
-    except (requests.ConnectionError, requests.Timeout):
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, OSError):
         return False

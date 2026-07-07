@@ -7,14 +7,21 @@
 import base64
 import io
 import time
-import requests
 from typing import List
-from PIL import Image
 
 from .abstract_client import AbstractSDClient, GenerationConfig, GenerationResult, with_reference_mode_hint
 from ..utils.logger import get_logger
 
 log = get_logger(__name__)
+
+
+def _requests_module():
+    try:
+        import requests
+        return requests
+    except ImportError:
+        from ..utils import simple_requests
+        return simple_requests
 
 
 class NanobananaClient(AbstractSDClient):
@@ -46,6 +53,8 @@ class NanobananaClient(AbstractSDClient):
         return base
 
     def check_health(self) -> bool:
+        requests = _requests_module()
+
         # 30 秒缓存，避免每次生成前都发请求耗尽配额
         now = time.time()
         if self._health_cache is not None and (now - self._health_cache_time) < 30:
@@ -101,17 +110,39 @@ class NanobananaClient(AbstractSDClient):
     def _generate_gemini(self, config: GenerationConfig) -> GenerationResult:
         """调用 Gemini generateContent API 生成图像（含 429 重试）。
 
+        局部导入 Pillow/requests，避免插件启用时依赖。
+
         SECURITY: Gemini API Key 通过 URL query param (?key=) 传递，
         可能被中间代理、CDN 或服务端日志记录。建议使用专属低权限 Key。
         """
+        requests = _requests_module()
+
         url = f"{self.base_url}/models/{self.model}:generateContent?key={self.api_key}"
         prompt = with_reference_mode_hint(config.prompt, config)
 
         parts = []
         if config.init_image is not None:
-            buf = io.BytesIO()
-            config.init_image.convert("RGB").save(buf, format="PNG")
-            img_b64 = base64.b64encode(buf.getvalue()).decode()
+            from ..utils.image_utils import encode_numpy_to_png_bytes
+            import numpy as np
+            try:
+                from PIL import Image
+                pil_available = True
+            except ImportError:
+                pil_available = False
+
+            init_img = config.init_image
+            if pil_available and isinstance(init_img, Image.Image):
+                buf = io.BytesIO()
+                init_img.convert("RGB").save(buf, format="PNG")
+                img_bytes = buf.getvalue()
+            elif isinstance(init_img, np.ndarray):
+                if init_img.ndim != 3 or init_img.shape[-1] not in (3, 4):
+                    raise TypeError(f"Gemini 参考图 numpy 数组形状不支持: {init_img.shape}")
+                img_bytes = encode_numpy_to_png_bytes(init_img[..., :3])
+            else:
+                raise TypeError("Gemini 参考图必须是 PIL Image 或 numpy 数组")
+
+            img_b64 = base64.b64encode(img_bytes).decode()
             parts.append({"inlineData": {"mimeType": "image/png", "data": img_b64}})
 
         parts.append({"text": prompt})
@@ -159,13 +190,15 @@ class NanobananaClient(AbstractSDClient):
         if self._progress_cb:
             self._progress_cb(0.8, "正在下载结果...")
 
+        from ..utils.image_utils import load_image_bytes_to_numpy
+
         images = []
         for candidate in data.get("candidates", []):
             for part in candidate.get("content", {}).get("parts", []):
                 if "inlineData" in part:
                     img_b64 = part["inlineData"]["data"]
                     img_bytes = base64.b64decode(img_b64)
-                    images.append(Image.open(io.BytesIO(img_bytes)))
+                    images.append(load_image_bytes_to_numpy(img_bytes))
 
         if not images:
             for candidate in data.get("candidates", []):
@@ -191,6 +224,8 @@ class NanobananaClient(AbstractSDClient):
 
     def _generate_legacy(self, config: GenerationConfig) -> GenerationResult:
         """旧版占位逻辑（非 Gemini URL 时保留）。"""
+        requests = _requests_module()
+
         url = f"{self.base_url}/images/generations"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -215,13 +250,15 @@ class NanobananaClient(AbstractSDClient):
         if self._progress_cb:
             self._progress_cb(0.8, "正在下载结果...")
 
+        from ..utils.image_utils import load_image_bytes_to_numpy
+
         images = []
         for item in data.get("images", []):
             img_url = item.get("url") or item.get("image_url")
             if img_url:
                 img_resp = requests.get(img_url, timeout=30)
                 img_resp.raise_for_status()
-                images.append(Image.open(io.BytesIO(img_resp.content)))
+                images.append(load_image_bytes_to_numpy(img_resp.content))
 
         if not images:
             raise RuntimeError("API 未返回任何图像。")

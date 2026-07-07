@@ -409,7 +409,10 @@ def build_texture_prompt(props) -> str:
 
     view_desc = f"{ori}拍摄" if ori else "正投影材质视角"
 
-    return f"{desc}。{view_desc}，无缝拼接，照片扫描超写实，平光照明，无阴影，无高光"
+    return (
+        f"{desc}。{view_desc}，漫反射 albedo 贴图，纯色无光影，"
+        f"无缝拼接，照片扫描超写实，平光照明，无阴影，无高光，无反光，无镜面反射"
+    )
 
 
 def _build_preservation_prompt(props) -> str:
@@ -418,7 +421,7 @@ def _build_preservation_prompt(props) -> str:
         "以参考图作为强视觉参考和主要依据",
         "尽量保留参考图的图案布局、颜色比例、纹理细节、材质类型和表面质感",
         "只做轻微清理、去噪、补边和无缝化，生成无缝可平铺 PBR 材质贴图",
-        "照片级真实感，平光照明，无阴影，UV就绪。",
+        "照片级真实感，平光照明，无阴影，无高光，无反光，UV就绪。",
     ]
     return "，".join(parts)
 
@@ -517,7 +520,10 @@ class CTProperties(bpy.types.PropertyGroup):
     # Prompt
     # -------------------------------------------------------------------------
     prompt: bpy.props.StringProperty(name="提示词", default="")
-    negative_prompt: bpy.props.StringProperty(name="负面提示词", default="low quality, blurry")
+    negative_prompt: bpy.props.StringProperty(
+        name="负面提示词",
+        default="highlights, specular, reflections, shadows, shading, glossy, shiny, low quality, blurry",
+    )
 
     # -------------------------------------------------------------------------
     # Parameters

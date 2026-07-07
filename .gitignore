@@ -6,6 +6,9 @@ __pycache__/
 # ComfyUI portable installation (downloaded at runtime)
 comfyui_portable/
 
+# Add-on managed Python dependencies (installed by one-click repair)
+vendor/
+
 # Generated assets (test outputs)
 assets/*.png
 

@@ -2,14 +2,132 @@ import bpy
 import time
 import os
 import sys
+import importlib
+import threading
+from typing import Dict, Optional
 
 from .sd_backend import comfyui_installer
 from .utils.logger import get_logger
 
 log = get_logger(__name__)
 
+# =============================================================================
+# 模型下载实时进度状态
+# =============================================================================
+_download_states: Dict[str, Dict] = {}
+_download_lock = threading.Lock()
+
+
+def start_download_state(model_id: str) -> bool:
+    """开始跟踪一个模型的下载状态。若该模型已在下载中则返回 False。"""
+    with _download_lock:
+        state = _download_states.get(model_id)
+        if state and not state.get("done"):
+            return False
+        _download_states[model_id] = {
+            "progress": 0.0,
+            "status": "准备中",
+            "done": False,
+        }
+        return True
+
+
+def update_download_state(model_id: str, progress: float, status: str):
+    with _download_lock:
+        state = _download_states.get(model_id)
+        if state:
+            state["progress"] = float(progress)
+            state["status"] = str(status)
+
+
+def finish_download_state(model_id: str, status: str = "完成"):
+    with _download_lock:
+        state = _download_states.get(model_id)
+        if state:
+            state["done"] = True
+            state["progress"] = 1.0
+            state["status"] = str(status)
+            state["finished_at"] = time.time()
+
+
+def get_download_state(model_id: str) -> Optional[Dict]:
+    with _download_lock:
+        state = _download_states.get(model_id)
+        return state.copy() if state else None
+
+
+def cleanup_download_states():
+    """清理已完成超过 2 秒的下载状态。"""
+    with _download_lock:
+        now = time.time()
+        to_remove = [
+            mid for mid, s in _download_states.items()
+            if s.get("done") and now - s.get("finished_at", now) > 2.0
+        ]
+        for mid in to_remove:
+            del _download_states[mid]
+
+
+def redraw_preference_areas():
+    """标记所有偏好设置面板区域需要重绘。"""
+    try:
+        for window in bpy.context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type == 'PREFERENCES':
+                    area.tag_redraw()
+    except Exception:
+        pass
+
+
+def poll_download_states():
+    """由 bpy.app.timers 调用，刷新下载进度 UI。"""
+    cleanup_download_states()
+    active = [s for s in _download_states.values() if not s.get("done")]
+    if active:
+        try:
+            if bpy.context and bpy.context.scene:
+                bpy.context.scene.ai_concept_props.status_message = f"正在下载模型: {active[0]['status']}"
+        except Exception:
+            pass
+        redraw_preference_areas()
+        return 0.5
+    try:
+        if bpy.context and bpy.context.scene:
+            bpy.context.scene.ai_concept_props.status_message = "模型下载完成"
+    except Exception:
+        pass
+    redraw_preference_areas()
+    return None
+
+
+def ensure_download_poll_timer():
+    """注册进度轮询 timer（若未注册）。"""
+    try:
+        if not bpy.app.timers.is_registered(poll_download_states):
+            bpy.app.timers.register(poll_download_states, first_interval=0.5)
+    except Exception as e:
+        log.debug("Could not register download poll timer: %s", e)
+
 API_PROVIDER_PREFIX = "API:"
 MAX_PANEL_IMAGE_MODELS = 8
+
+DEPENDENCY_PROFILES = {
+    'LOCAL_PBR': [
+        ("numpy", "numpy", "数值计算（本地 PBR）"),
+    ],
+    'API': [
+        ("PIL", "Pillow", "图像解码增强"),
+        ("requests", "requests", "API 通信增强"),
+    ],
+    'COMFYUI': [
+        ("PIL", "Pillow", "图像解码增强"),
+        ("requests", "requests", "ComfyUI HTTP 通信增强"),
+        ("websocket", "websocket-client", "ComfyUI 实时进度增强"),
+    ],
+    'INSTALLER': [
+        ("py7zr", "py7zr", "7z 解压（可选）"),
+    ],
+}
 
 
 def resolve_asset_output_path(prefs) -> str:
@@ -94,6 +212,36 @@ def selected_model_or_default(selected: str, default: str) -> str:
     if selected and selected not in {'DEFAULT', 'NONE'}:
         return selected
     return default
+
+
+def dependency_missing_for_profile(profile: str) -> list:
+    deps = []
+    if profile == 'ALL':
+        seen = set()
+        for items in DEPENDENCY_PROFILES.values():
+            for dep in items:
+                if dep[0] not in seen:
+                    deps.append(dep)
+                    seen.add(dep[0])
+    else:
+        deps = DEPENDENCY_PROFILES.get(profile, [])
+
+    missing = []
+    for import_name, pip_name, desc in deps:
+        try:
+            __import__(import_name)
+        except ImportError:
+            missing.append((import_name, pip_name, desc))
+    return missing
+
+
+def _requests_module():
+    try:
+        import requests
+        return requests
+    except ImportError:
+        from .utils import simple_requests
+        return simple_requests
 
 
 def ensure_default_api_providers(prefs):
@@ -252,7 +400,7 @@ class AI_OT_TestProviderConnection(bpy.types.Operator):
     provider: bpy.props.StringProperty(default='COMFYUI')
 
     def execute(self, context):
-        import requests
+        requests = _requests_module()
 
         addon_pkg = __package__.split('.')[0]
         prefs = context.preferences.addons[addon_pkg].preferences
@@ -338,12 +486,7 @@ class AI_OT_AddAPIProvider(bpy.types.Operator):
         provider.default_text_model = "gpt-5.5"
         provider.default_vision_model = "gpt-4o"
         prefs.active_api_provider_index = len(prefs.api_providers) - 1
-        # 标记 preferences 已修改并保存，避免重启后丢失
         context.preferences.is_dirty = True
-        try:
-            bpy.ops.wm.save_userpref()
-        except Exception:
-            log.debug("wm.save_userpref failed (preferences may already be saved)")
         return {'FINISHED'}
 
 
@@ -364,10 +507,6 @@ class AI_OT_RemoveAPIProvider(bpy.types.Operator):
         prefs.api_providers.remove(idx)
         prefs.active_api_provider_index = min(max(0, idx - 1), max(0, len(prefs.api_providers) - 1))
         context.preferences.is_dirty = True
-        try:
-            bpy.ops.wm.save_userpref()
-        except Exception:
-            log.debug("wm.save_userpref failed (preferences may already be saved)")
         return {'FINISHED'}
 
 
@@ -543,7 +682,7 @@ class AI_OT_FetchModels(bpy.types.Operator):
 
     def _fetch_openai_models(self, url: str, api_key: str) -> list:
         """请求 OpenAI 兼容 /models，返回原始模型 ID 列表。"""
-        import requests
+        requests = _requests_module()
         headers = self._model_headers(api_key, "openai")
         resp = requests.get(url, headers=headers, timeout=15)
         if resp.status_code in (301, 302, 303, 307, 308):
@@ -562,7 +701,7 @@ class AI_OT_FetchModels(bpy.types.Operator):
 
     def _fetch_gemini_models(self, url: str, api_key: str) -> list:
         """请求 Gemini /v1beta/models，返回模型名列表。"""
-        import requests
+        requests = _requests_module()
         req_url = f"{self._models_url(url, 'gemini')}?key={api_key}"
         resp = requests.get(req_url, timeout=15)
         if self._looks_like_html(resp.text):
@@ -637,12 +776,7 @@ class AI_OT_FetchModels(bpy.types.Operator):
             info_msg += f"，vision={provider.default_vision_model}"
         self.report({'INFO'}, info_msg)
 
-        # 拉取的模型列表需要持久化保存
         context.preferences.is_dirty = True
-        try:
-            bpy.ops.wm.save_userpref()
-        except Exception:
-            log.debug("wm.save_userpref failed during model fetch (prefs may be auto-saved)")
 
         for window in context.window_manager.windows:
             for area in window.screen.areas:
@@ -682,6 +816,50 @@ class AI_OT_RefreshComfyUIModels(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class AI_OT_RepairDependencies(bpy.types.Operator):
+    bl_idname = "ai_concept.repair_dependencies"
+    bl_label = "一键修复环境依赖"
+    bl_description = "安装当前功能所需的 Python 组件"
+    bl_options = {'REGISTER', 'INTERNAL'}
+
+    profile: bpy.props.EnumProperty(
+        name="修复范围",
+        items=[
+            ('API', "API 增强组件", ""),
+            ('COMFYUI', "本地 ComfyUI 增强组件", ""),
+            ('LOCAL_PBR', "本地 PBR 组件", ""),
+            ('INSTALLER', "安装器增强组件", ""),
+            ('ALL', "全部推荐组件", ""),
+        ],
+        default='API',
+    )
+
+    def execute(self, context):
+        addon_pkg = __package__.split('.')[0]
+        addon_mod = importlib.import_module(addon_pkg)
+        if hasattr(addon_mod, "_inject_vendor_site"):
+            addon_mod._inject_vendor_site()
+
+        missing = dependency_missing_for_profile(self.profile)
+        if not missing:
+            self.report({'INFO'}, "所需组件已就绪")
+            return {'FINISHED'}
+
+        missing_display = [f"{import_name} ({desc})" for import_name, _pip_name, desc in missing]
+
+        def verifier():
+            return [f"{i} ({d})" for i, _p, d in dependency_missing_for_profile(self.profile)]
+
+        ok, msg = addon_mod._auto_install_dependencies(missing_display, verifier=verifier)
+        if ok:
+            if self.profile in {'LOCAL_PBR', 'ALL'}:
+                msg += "。基础组件修复后请重新启用插件或重启 Blender。"
+            self.report({'INFO'}, msg)
+            return {'FINISHED'}
+        self.report({'ERROR'}, msg)
+        return {'CANCELLED'}
+
+
 class CTAddonPreferences(bpy.types.AddonPreferences):
     bl_idname = __package__
 
@@ -693,12 +871,6 @@ class CTAddonPreferences(bpy.types.AddonPreferences):
     comfyui_url: bpy.props.StringProperty(
         name="ComfyUI 地址",
         default="http://127.0.0.1:8188",
-    )
-
-    comfyui_controlnet_tile_model: bpy.props.StringProperty(
-        name="ControlNet Tile 模型",
-        description="ComfyUI 中 ControlNet Tile 模型文件名，例如 control_v11f1e_sd15_tile.pth。有参考图时会注入此模型",
-        default="control_v11f1e_sd15_tile.pth",
     )
 
     comfyui_path: bpy.props.StringProperty(
@@ -783,6 +955,7 @@ class CTAddonPreferences(bpy.types.AddonPreferences):
 
         install_path = self.comfyui_path or comfyui_installer.get_default_install_path()
         installed = comfyui_installer.is_comfyui_installed(install_path)
+        has_configured_comfyui_path = bool((self.comfyui_path or "").strip())
 
         ctype = comfyui_installer.get_comfyui_type(install_path)
         if sys.platform != 'win32' and ctype != "desktop" and not installed:
@@ -806,12 +979,15 @@ class CTAddonPreferences(bpy.types.AddonPreferences):
             row = box.row()
             row.operator("ai_concept.install_comfyui", text="自动下载安装", icon='IMPORT')
 
-        # 安装完成后即显示测试与 ControlNet Tile 配置（允许使用默认路径）
+        # 安装完成后即显示测试（允许使用默认路径）
         if installed:
             row = box.row(align=True)
             op = row.operator("ai_concept.test_provider_connection", text="测试", icon='CHECKMARK')
             op.provider = 'COMFYUI'
-            box.prop(self, "comfyui_controlnet_tile_model")
+            if has_configured_comfyui_path:
+                row = box.row(align=True)
+                op = row.operator("ai_concept.repair_dependencies", text="一键修复环境依赖", icon='IMPORT')
+                op.profile = 'COMFYUI'
 
         # Model Manager：仅在 ComfyUI 安装完成后显示
         if installed:
@@ -826,6 +1002,8 @@ class CTAddonPreferences(bpy.types.AddonPreferences):
             for model in comfyui_installer.get_model_registry():
                 actual_path = comfyui_installer.find_model_file(install_path, model)
                 is_installed = actual_path is not None
+                dl_state = get_download_state(model["id"])
+                downloading = dl_state is not None and not dl_state.get("done")
                 col = model_box.column(align=True)
                 row = col.row(align=True)
                 icon = 'CHECKMARK' if is_installed else 'CANCEL'
@@ -833,10 +1011,21 @@ class CTAddonPreferences(bpy.types.AddonPreferences):
                 row.label(text=f"{model['label']} ({model['size']}){gated_text}", icon=icon)
                 if not is_installed:
                     if model.get("url"):
-                        op = row.operator("ai_concept.download_model", text="下载", icon='IMPORT')
-                        op.model_id = model["id"]
+                        if downloading:
+                            row.label(text="下载中...", icon='SORTTIME')
+                        else:
+                            op = row.operator("ai_concept.download_model", text="下载", icon='IMPORT')
+                            op.model_id = model["id"]
                 op2 = row.operator("ai_concept.open_model_download_page", text="网页", icon='URL')
                 op2.model_id = model["id"]
+                if downloading:
+                    prog_row = col.row(align=True)
+                    prog_row.scale_y = 0.8
+                    prog_row.progress(
+                        factor=dl_state["progress"],
+                        type='BAR',
+                        text=dl_state["status"],
+                    )
                 # 显示模型应存放路径或实际找到的路径
                 path_row = col.row()
                 path_row.scale_y = 0.8
@@ -904,6 +1093,7 @@ classes = [
     AI_OT_RemoveAPIProvider,
     AI_OT_FetchModels,
     AI_OT_RefreshComfyUIModels,
+    AI_OT_RepairDependencies,
 ]
 
 

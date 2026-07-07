@@ -2,6 +2,19 @@
 
 All notable changes to AI Texture to PBR will be documented in this file.
 
+## [1.1.4] - 2026-07-03
+
+### Changed
+- 本地离线 PBR 无缝算法升级为统一的 `SMART` 模式，移除原 `BASIC`/`ADVANCED`：
+  - 引导滤波去除低频光照/颜色梯度，解决平整纹理的明暗接缝。
+  - 特征重要性图 + 最小误差边界（MEB）找最佳接缝路径，自动避开菱形、锈斑等高对比特征。
+  - 拉普拉斯金字塔多频段混合，低频宽混、高频窄混，保留花纹锐度。
+  - 法线贴图在切线空间向量域处理并归一化。
+  - 新增周期感知处理：自相关检测规则花纹，自动使用窄混合带（约 2.5 倍周期）减少宽灰带；周期纹理使用平面拟合去梯度，避免模糊高频图案；相位对齐在能显著降低边缘不匹配时自动生效。
+
+### Fixed
+- 修复 ModelScope Z-Image 系列模型调用错误：改为使用 `height/width + num_inference_steps/guidance_scale` 参数；Qwen-Image 系列保持 `size` 参数。
+
 ## [1.1.2] - 2026-06-18
 
 ### Added
@@ -17,6 +30,7 @@ All notable changes to AI Texture to PBR will be documented in this file.
 - 桌面版 ComfyUI 支持自动启动：优先查找 venv/`.venv` 中的 Python，找不到时回退系统 Python。
 - 修复 Blender Image 与保存的 PNG 上下镜像问题：写入 Blender pixels 前对 PIL 图像做垂直翻转，预览/3D 材质与磁盘文件方向一致。
 - 放宽 ComfyUI 连接/启动探测的超时与错误处理，减少启动初期因响应慢导致的 ReadTimeout 误报。
+- 新增必需依赖自动安装：启用插件时若缺少 Pillow/numpy，自动调用 Blender 内置 pip 安装，无需用户手动命令行。
 - 修复输出参数区显示逻辑：种子只在 LOCAL_COMFYUI 后端下显示，API 模式下隐藏；「本地离线 PBR 烘焙」开关只要检测到本地 ComfyUI 就绪即显示，API 模式下也可选择跳过 CHORD。
 - 「AI 优化提示词」无 API 时回退到本地基于材质配置的规则扩展，不再直接报错。
 - 「反推提示词」无 API 时提示用户配置 API Provider 或本地 Ollama。

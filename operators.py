@@ -11,6 +11,11 @@ from .sd_backend import comfyui_installer
 from .utils.logger import get_logger
 from . import preferences as pref_utils
 from .properties import build_texture_prompt
+from .utils.image_utils import (
+    blender_image_to_numpy,
+    numpy_to_blender_image,
+    save_numpy_image,
+)
 
 log = get_logger(__name__)
 
@@ -73,6 +78,29 @@ def _set_window_pos(hwnd, x, y, w, h):
         ctypes.windll.user32.SetWindowPos(hwnd, 0, x, y, w, h, SWP_NOZORDER)
     except Exception:
         log.debug("SetWindowPos failed (expected on non-Windows)")
+
+
+def _unique_image_name(prefix: str, basename: str) -> str:
+    import time
+
+    stem, ext = os.path.splitext(os.path.basename(basename))
+    stem = stem or "Image"
+    candidate = f"{prefix}_{time.strftime('%Y%m%d_%H%M%S')}_{stem}{ext}"
+    if candidate not in bpy.data.images:
+        return candidate
+    idx = 1
+    while f"{candidate}_{idx:02d}" in bpy.data.images:
+        idx += 1
+    return f"{candidate}_{idx:02d}"
+
+
+def _requests_module():
+    try:
+        import requests
+        return requests
+    except ImportError:
+        from .utils import simple_requests
+        return simple_requests
 
 
 class AI_OT_GenerateTexture(bpy.types.Operator):
@@ -147,14 +175,12 @@ class AI_OT_LoadReferenceImage(bpy.types.Operator):
             self.report({'ERROR'}, "未选择有效文件")
             return {'CANCELLED'}
 
-        # 加载图片到 Blender
-        img_name = os.path.basename(self.filepath)
-        # 避免命名冲突
-        if img_name in bpy.data.images:
-            bpy.data.images.remove(bpy.data.images[img_name])
+        # 加载图片到 Blender，使用插件私有名称，避免删除用户已有同名图像
+        img_name = _unique_image_name("AIRef", self.filepath)
 
         image = bpy.data.images.load(self.filepath, check_existing=False)
         image.name = img_name
+        image["ai_concept_owned"] = True
         image.update()
 
         # 使用和生成结果相同的 preview collection 机制加载预览，保证放大清晰度一致
@@ -172,6 +198,228 @@ class AI_OT_LoadReferenceImage(bpy.types.Operator):
         return {'RUNNING_MODAL'}
 
 
+def _grab_clipboard_with_pil():
+    """使用 Pillow 读取剪贴板图像或图片文件路径，返回 (numpy RGBA array, width, height) 或 None。"""
+    import numpy as np
+    from PIL import Image, ImageGrab
+    result = ImageGrab.grabclipboard()
+    if result is None:
+        return None
+
+    if isinstance(result, Image.Image):
+        pil_img = result
+    elif isinstance(result, list) and result:
+        # 剪贴板中是文件路径列表，加载第一个图片文件
+        for path in result:
+            if os.path.isfile(path):
+                try:
+                    pil_img = Image.open(path)
+                    break
+                except Exception as e:
+                    log.warning("Cannot open clipboard file %s: %s", path, e)
+                    continue
+        else:
+            return None
+    else:
+        return None
+
+    if pil_img.mode != 'RGBA':
+        pil_img = pil_img.convert('RGBA')
+    return np.array(pil_img), pil_img.size[0], pil_img.size[1]
+
+
+def _grab_clipboard_windows_ctypes():
+    """Windows 无 Pillow 时使用 ctypes 读取剪贴板图像。
+
+    支持格式（按优先级）：image/png、PNG、CF_HDROP、CF_DIBV5、CF_DIB。
+    返回 (numpy RGBA array, width, height) 或 None。
+    失败时通过 log.warning 输出诊断信息。
+    """
+    import ctypes
+    import struct
+    import tempfile
+
+    from .utils.image_utils import blender_image_to_numpy
+
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+
+    user32.OpenClipboard.argtypes = [ctypes.c_void_p]
+    user32.OpenClipboard.restype = ctypes.c_bool
+    user32.GetClipboardData.argtypes = [ctypes.c_uint]
+    user32.GetClipboardData.restype = ctypes.c_void_p
+    user32.CloseClipboard.restype = ctypes.c_bool
+    user32.RegisterClipboardFormatW.argtypes = [ctypes.c_wchar_p]
+    user32.RegisterClipboardFormatW.restype = ctypes.c_uint
+    user32.EnumClipboardFormats.argtypes = [ctypes.c_uint]
+    user32.EnumClipboardFormats.restype = ctypes.c_uint
+    user32.GetClipboardFormatNameW.argtypes = [ctypes.c_uint, ctypes.c_wchar_p, ctypes.c_int]
+    user32.GetClipboardFormatNameW.restype = ctypes.c_int
+    kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalUnlock.restype = ctypes.c_bool
+    kernel32.GlobalSize.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalSize.restype = ctypes.c_size_t
+
+    CF_DIB = 8
+    CF_DIBV5 = 17
+    CF_BITMAP = 2
+    CF_HDROP = 15
+
+    def _last_error():
+        return ctypes.windll.kernel32.GetLastError()
+
+    def _read_hglobal(hglobal):
+        if not hglobal:
+            return None
+        ptr = kernel32.GlobalLock(hglobal)
+        if not ptr:
+            log.warning("GlobalLock failed, err=%s", _last_error())
+            return None
+        try:
+            size = kernel32.GlobalSize(hglobal)
+            return ctypes.string_at(ptr, size)
+        finally:
+            kernel32.GlobalUnlock(hglobal)
+
+    def _load_temp_image(temp_path):
+        try:
+            blender_img = bpy.data.images.load(temp_path, check_existing=False)
+            width, height = blender_img.size
+            arr = blender_image_to_numpy(blender_img)
+            bpy.data.images.remove(blender_img)
+            log.warning("Loaded clipboard image via Blender: %sx%s", int(width), int(height))
+            return arr, int(width), int(height)
+        except Exception as e:
+            log.warning("Load temp image failed for %s: %s", temp_path, e)
+            return None
+
+    if not user32.OpenClipboard(None):
+        log.warning("OpenClipboard failed, err=%s", _last_error())
+        raise RuntimeError("无法打开剪贴板")
+
+    temp_path = None
+    try:
+        # 1) 优先尝试 image/png / PNG 格式（QQ/微信/截图工具常用）
+        for fmt_name in ("image/png", "PNG"):
+            fmt_id = user32.RegisterClipboardFormatW(fmt_name)
+            if not fmt_id:
+                continue
+            data = _read_hglobal(user32.GetClipboardData(fmt_id))
+            if data:
+                log.warning("%s format data size=%s, header=%s", fmt_name, len(data), data[:8])
+                if data[:4] == b'\x89PNG':
+                    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
+                        f.write(data)
+                        temp_path = f.name
+                    result = _load_temp_image(temp_path)
+                    if result:
+                        return result
+                else:
+                    log.warning("%s format data has invalid header", fmt_name)
+
+        # 2) 尝试 CF_HDROP（剪贴板中是图片文件路径）
+        hdrop = user32.GetClipboardData(CF_HDROP)
+        if hdrop:
+            log.warning("Using CF_HDROP clipboard format")
+            data = _read_hglobal(hdrop)
+            if data and len(data) >= 20:
+                # DROPFILES 结构，pFiles 是文件列表偏移
+                p_files = struct.unpack_from('<I', data, 0)[0]
+                f_wide = struct.unpack_from('<I', data, 16)[0]
+                paths_bytes = data[p_files:]
+                if f_wide:
+                    paths = paths_bytes.decode('utf-16-le').split('\x00')
+                else:
+                    paths = paths_bytes.decode('mbcs').split('\x00')
+                # 过滤空字符串和最后一个双 null 后的空项
+                paths = [p for p in paths if p]
+                log.warning("CF_HDROP paths: %s", paths[:5])
+                for path in paths:
+                    ext = os.path.splitext(path)[1].lower()
+                    if ext in ('.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif', '.webp'):
+                        try:
+                            result = _load_temp_image(path)
+                            if result:
+                                return result
+                        except Exception as e:
+                            log.warning("Failed to load dropped image %s: %s", path, e)
+
+        # 3) 尝试 CF_DIBV5 / CF_DIB
+        hglobal = user32.GetClipboardData(CF_DIBV5)
+        if hglobal:
+            log.warning("Using CF_DIBV5 clipboard format")
+        else:
+            hglobal = user32.GetClipboardData(CF_DIB)
+            if hglobal:
+                log.warning("Using CF_DIB clipboard format")
+
+        if hglobal:
+            raw_bytes = _read_hglobal(hglobal)
+            if raw_bytes and len(raw_bytes) >= 4:
+                log.warning("DIB data size=%s", len(raw_bytes))
+                header_size = struct.unpack_from('<I', raw_bytes, 0)[0]
+                log.warning("DIB header size=%s", header_size)
+                if header_size in (12, 40, 52, 56, 64, 108, 124) and len(raw_bytes) >= header_size:
+                    width = struct.unpack_from('<i', raw_bytes, 4)[0]
+                    height = struct.unpack_from('<i', raw_bytes, 8)[0]
+                    bit_count = struct.unpack_from('<H', raw_bytes, 14)[0]
+                    compression = struct.unpack_from('<I', raw_bytes, 16)[0]
+                    clr_used = struct.unpack_from('<I', raw_bytes, 32)[0]
+                    log.warning("DIB width=%s height=%s bit_count=%s compression=%s", width, height, bit_count, compression)
+
+                    if compression in (0, 3, 6):
+                        if height < 0:
+                            height = -height
+                        color_table_size = 0
+                        if bit_count <= 8:
+                            color_count = clr_used if clr_used else (1 << bit_count)
+                            color_table_size = color_count * 4
+
+                        pixel_offset = 14 + header_size + color_table_size
+                        file_header = struct.pack(
+                            '<2sIHHI', b'BM', 14 + len(raw_bytes), 0, 0, pixel_offset,
+                        )
+                        with tempfile.NamedTemporaryFile(suffix='.bmp', delete=False) as f:
+                            f.write(file_header + raw_bytes)
+                            temp_path = f.name
+                        result = _load_temp_image(temp_path)
+                        if result:
+                            return result
+                    else:
+                        log.warning("Compressed DIB not supported: compression=%s", compression)
+
+        # 3) 调试：记录可用的剪贴板格式
+        fmt = 0
+        available = []
+        format_names = {}
+        while True:
+            fmt = user32.EnumClipboardFormats(fmt)
+            if fmt == 0:
+                break
+            available.append(fmt)
+            buf = ctypes.create_unicode_buffer(256)
+            if user32.GetClipboardFormatNameW(fmt, buf, 256):
+                format_names[fmt] = buf.value
+            elif fmt == CF_BITMAP:
+                format_names[fmt] = "CF_BITMAP"
+            elif fmt == CF_DIB:
+                format_names[fmt] = "CF_DIB"
+            elif fmt == CF_DIBV5:
+                format_names[fmt] = "CF_DIBV5"
+        log.warning("Available clipboard formats: %s", available)
+        log.warning("Clipboard format names: %s", format_names)
+        return None
+    finally:
+        user32.CloseClipboard()
+        if temp_path:
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
+
+
 class AI_OT_PasteReferenceImage(bpy.types.Operator):
     bl_idname = "ai_concept.paste_reference_image"
     bl_label = "粘贴参考图"
@@ -179,52 +427,80 @@ class AI_OT_PasteReferenceImage(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        try:
-            from PIL import Image, ImageGrab
-            pil_img = ImageGrab.grabclipboard()
-            if pil_img is None or not isinstance(pil_img, Image.Image):
-                self.report({'ERROR'}, "剪贴板中没有图像")
-                return {'CANCELLED'}
-        except Exception as e:
-            self.report({'ERROR'}, f"无法读取剪贴板: {e}")
-            return {'CANCELLED'}
-
+        import numpy as np
         import time
         import tempfile
 
-        # 颜色模式与扩展名
-        if pil_img.mode in ('RGBA', 'P'):
-            pil_img = pil_img.convert('RGBA')
-            ext = '.png'
-        else:
-            pil_img = pil_img.convert('RGB')
-            ext = '.jpg'
+        # 1) 优先使用 Pillow（跨平台、支持更多格式）
+        clipboard_result = None
+        pil_error = ""
+        try:
+            clipboard_result = _grab_clipboard_with_pil()
+        except ImportError:
+            pil_error = "Pillow not installed"
+        except Exception as e:
+            pil_error = str(e)
+            log.warning("PIL clipboard failed: %s", e)
+
+        # 2) 无 Pillow 时，Windows 用 ctypes 读剪贴板
+        ctypes_error = ""
+        if clipboard_result is None and os.name == 'nt':
+            try:
+                clipboard_result = _grab_clipboard_windows_ctypes()
+            except Exception as e:
+                ctypes_error = str(e)
+                log.warning("Windows ctypes clipboard failed: %s", e)
+
+        if clipboard_result is None:
+            msg = "无法读取剪贴板图像。"
+            if pil_error:
+                msg += f" Pillow: {pil_error}."
+            if ctypes_error:
+                msg += f" ctypes: {ctypes_error}."
+            self.report(
+                {'ERROR'},
+                msg + " 打开「Window → Toggle System Console」查看详细格式日志。"
+            )
+            return {'CANCELLED'}
+
+        arr, width, height = clipboard_result
 
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         img_name = f"Ref_Pasted_{timestamp}"
 
-        # 保存到系统临时目录用于预览（图片本身 pack 进 .blend，不会永久保留在磁盘）
+        # 保存到系统临时目录用于预览
         temp_dir = os.path.join(tempfile.gettempdir(), "BlenderAI")
         os.makedirs(temp_dir, exist_ok=True)
-        temp_path = os.path.join(temp_dir, f"{img_name}{ext}")
-        pil_img.save(temp_path)
+        temp_path = os.path.join(temp_dir, f"{img_name}.png")
 
-        # 加载到 Blender 并 pack（数据存入 .blend，不依赖外部文件）
+        try:
+            save_numpy_image(arr, temp_path, file_format='PNG')
+        except Exception as e:
+            # 无 Pillow 且 Blender API 保存失败时，尝试用 Pillow
+            try:
+                from PIL import Image
+                Image.fromarray(arr, 'RGBA').save(temp_path)
+            except ImportError:
+                self.report({'ERROR'}, f"保存剪贴板图像失败: {e}")
+                return {'CANCELLED'}
+
+        # 加载到 Blender 并 pack
         if img_name in bpy.data.images:
-            bpy.data.images.remove(bpy.data.images[img_name])
+            img_name = _unique_image_name("Ref_Pasted", img_name)
 
         image = bpy.data.images.load(temp_path, check_existing=False)
         image.name = img_name
+        image["ai_concept_owned"] = True
         image.pack()
         image.update()
 
-        # 注册预览（需要磁盘文件；预览读取后即可删除临时文件）
+        # 注册预览
         preview_manager.remove_preview(img_name)
         preview_manager.load_preview(img_name, temp_path)
 
         props = context.scene.ai_concept_props
         props.reference_image = image
-        self.report({'INFO'}, f"已从剪贴板粘贴参考图 ({pil_img.size[0]}x{pil_img.size[1]})")
+        self.report({'INFO'}, f"已从剪贴板粘贴参考图 ({width}x{height})")
         return {'FINISHED'}
 
 
@@ -305,7 +581,7 @@ class AI_OT_OptimizePrompt(bpy.types.Operator):
             "4. 直接返回优化后的提示词，不要添加任何解释或额外内容。"
         )
 
-        import requests
+        requests = _requests_module()
         try:
             if protocol == 'GEMINI':
                 # SECURITY: Gemini API Key 要求通过 URL query param 传递 API Key。
@@ -506,7 +782,6 @@ class AI_OT_ChannelPackRebuild(bpy.types.Operator):
 
     def execute(self, context):
         import numpy as np
-        from PIL import Image
 
         props = context.scene.ai_concept_props
         addon_name = __package__.split('.')[0]
@@ -548,16 +823,14 @@ class AI_OT_ChannelPackRebuild(bpy.types.Operator):
         if 'height' in map_names:
             height_img = bpy.data.images.get(map_names['height'])
 
-        # Blender Image -> PIL
-        def _to_pil(img):
-            w, h = img.size
-            arr = np.array(img.pixels[:]).reshape((h, w, 4))
-            arr = (arr * 255).astype(np.uint8)
-            return Image.fromarray(arr, 'RGBA').convert('RGB')
+        # Blender Image -> numpy RGB
+        def _to_numpy_rgb(img):
+            arr = blender_image_to_numpy(img)
+            return arr[..., :3]
 
-        roughness_pil = _to_pil(roughness_img)
-        metallic_pil = _to_pil(metallic_img)
-        height_pil = _to_pil(height_img) if height_img else None
+        roughness_np = _to_numpy_rgb(roughness_img)
+        metallic_np = _to_numpy_rgb(metallic_img)
+        height_np = _to_numpy_rgb(height_img) if height_img else None
 
         # 生成 packed 贴图
         from .material.pbr_processor import generate_packed_map
@@ -567,7 +840,7 @@ class AI_OT_ChannelPackRebuild(bpy.types.Operator):
             'b': props.pack_channel_b,
             'a': props.pack_channel_a,
         }
-        packed_pil = generate_packed_map(roughness_pil, metallic_pil, pack_config, ao=None, height=height_pil)
+        packed_np = generate_packed_map(roughness_np, metallic_np, pack_config, ao=None, height=height_np)
 
         # 输出目录：与已有贴图同目录，解析失败时用偏好设置路径
         output_dir = os.path.dirname(bpy.path.abspath(roughness_img.filepath_raw))
@@ -582,26 +855,18 @@ class AI_OT_ChannelPackRebuild(bpy.types.Operator):
         packed_name = f"{obj.name}_packed_{batch_id}"
 
         # 创建 Blender Image
-        packed_blender = bpy.data.images.new(
-            name=packed_name,
-            width=packed_pil.size[0],
-            height=packed_pil.size[1],
-        )
-
-        rgba = packed_pil.convert('RGBA')
-        # Blender pixels 原点在左下角，PIL 原点在左上角，需垂直翻转才能一致
-        rgba = rgba.transpose(Image.FLIP_TOP_BOTTOM)
-        pixels = list(rgba.getdata())
-        flat = [float(c) / 255.0 for px in pixels for c in px]
-        packed_blender.pixels.foreach_set(flat)
-        packed_blender.update()
+        packed_blender = numpy_to_blender_image(packed_name, packed_np)
         packed_blender.pack()
 
         save_path = os.path.join(output_dir, f"{packed_name}.png")
-        packed_pil.save(save_path)
         packed_blender.filepath_raw = save_path.replace('\\', '/')
         packed_blender.file_format = 'PNG'
         packed_blender.colorspace_settings.name = 'Non-Color'
+        try:
+            packed_blender.save()
+        except Exception as e:
+            from PIL import Image
+            Image.fromarray(packed_np, 'RGBA').save(save_path)
 
         # 构建 images 字典重建材质
         images = {}
@@ -624,31 +889,17 @@ class AI_OT_ChannelPackRebuild(bpy.types.Operator):
         else:
             obj.data.materials[0] = mat
 
-        # 记录 packed 贴图到结果中
-        has_packed = any(m.map_type == 'packed' for m in result.pbr_maps)
-        if not has_packed:
+        # 记录 packed 贴图到结果中；已有 packed 时更新引用
+        packed_item = next((m for m in result.pbr_maps if m.map_type == 'packed'), None)
+        if packed_item is None:
             map_item = result.pbr_maps.add()
             map_item.map_type = 'packed'
             map_item.image_name = packed_blender.name
-
-        # 被 pack 进通道的原始贴图不再单独显示在预览中
-        content_to_map_type = {
-            'ROUGHNESS': 'roughness',
-            'METALLIC': 'metallic',
-            'AO': 'ao',
-            'HEIGHT': 'height',
-        }
-        packed_map_types = {
-            content_to_map_type[content]
-            for content in pack_config.values()
-            if content in content_to_map_type
-        }
-        # 从后往前移除，避免索引变化
-        for i in range(len(result.pbr_maps) - 1, -1, -1):
-            if result.pbr_maps[i].map_type in packed_map_types:
-                result.pbr_maps.remove(i)
+        else:
+            packed_item.image_name = packed_blender.name
 
         from .ui import preview_manager
+        preview_manager.remove_preview(packed_blender.name)
         preview_manager.load_preview(packed_blender.name, save_path)
 
         self.report({'INFO'}, "通道打包材质已重建")
@@ -734,7 +985,8 @@ class AI_OT_ClearReferenceImage(bpy.types.Operator):
         props = context.scene.ai_concept_props
         if props.reference_image:
             preview_manager.remove_preview(props.reference_image.name)
-            if props.reference_image.name in bpy.data.images:
+            owned = bool(props.reference_image.get("ai_concept_owned", False))
+            if owned and props.reference_image.name in bpy.data.images:
                 bpy.data.images.remove(bpy.data.images[props.reference_image.name])
         props.reference_image = None
         return {'FINISHED'}
@@ -761,7 +1013,10 @@ class AI_OT_CaptionReferenceImage(bpy.types.Operator):
 
     USER_PROMPT = "请分析这张图片的材质纹理特征，按上述字段输出 JSON。"
 
-    PBR_SUFFIX = "无缝拼接，照片扫描超写实，平光照明，无阴影，无高光，正投影材质视角，UV就绪"
+    PBR_SUFFIX = (
+        "无缝拼接，照片扫描超写实，平光照明，无阴影，无高光，无反光，"
+        "无镜面反射，正投影材质视角，UV就绪"
+    )
 
     def _get_provider_snapshot(self, context, prefs):
         pref_utils.ensure_default_api_providers(prefs)
@@ -785,9 +1040,8 @@ class AI_OT_CaptionReferenceImage(bpy.types.Operator):
 
     def _image_to_base64(self, blender_image):
         import numpy as np
-        from PIL import Image
-        import io
         import base64
+        from .utils.image_utils import blender_image_to_numpy, resize_numpy_image, encode_numpy_to_png_bytes
 
         width, height = blender_image.size
         if width <= 0 or height <= 0:
@@ -796,18 +1050,20 @@ class AI_OT_CaptionReferenceImage(bpy.types.Operator):
         if pixels is None or len(pixels) == 0:
             raise ValueError("无法读取图片像素数据（图片可能未加载或已被删除）")
 
-        np_pixels = np.array(pixels[:], dtype=np.float32)
-        np_pixels = np_pixels.reshape((height, width, 4))
-        np_pixels = (np_pixels * 255).astype(np.uint8)
-        pil_img = Image.fromarray(np_pixels, 'RGBA').convert('RGB')
+        np_pixels = blender_image_to_numpy(blender_image)[..., :3]  # RGB
 
         max_size = 1024
-        if max(pil_img.size) > max_size:
-            pil_img.thumbnail((max_size, max_size), Image.LANCZOS)
+        if max(width, height) > max_size:
+            if width > height:
+                new_w = max_size
+                new_h = int(height * max_size / width)
+            else:
+                new_h = max_size
+                new_w = int(width * max_size / height)
+            np_pixels = resize_numpy_image(np_pixels, new_w, new_h)
 
-        buffer = io.BytesIO()
-        pil_img.save(buffer, format="PNG")
-        return base64.b64encode(buffer.getvalue()).decode()
+        img_bytes = encode_numpy_to_png_bytes(np_pixels)
+        return base64.b64encode(img_bytes).decode()
 
     def _parse_caption_json(self, text):
         """从模型返回文本中解析 JSON 并融合为自然语言。"""
@@ -882,7 +1138,7 @@ class AI_OT_CaptionReferenceImage(bpy.types.Operator):
             self.report({'ERROR'}, f"参考图转换失败: {e}")
             return {'CANCELLED'}
 
-        import requests
+        requests = _requests_module()
         try:
             if protocol == 'GEMINI':
                 # SECURITY: Gemini API Key 通过 URL query param 传递，见上文说明。
@@ -1212,7 +1468,7 @@ def _poll_install():
 class AI_OT_InstallComfyUI(bpy.types.Operator):
     bl_idname = "ai_concept.install_comfyui"
     bl_label = "安装 ComfyUI"
-    bl_description = "下载并安装 ComfyUI（约 15 GB）+ 模型（约 10 GB），共需约 25 GB 磁盘空间，NVIDIA GPU 推荐"
+    bl_description = "下载并安装 ComfyUI 本体和必需节点；模型需在模型管理器中单独下载"
     bl_options = {'REGISTER'}
 
     install_path: bpy.props.StringProperty(
@@ -1230,9 +1486,9 @@ class AI_OT_InstallComfyUI(bpy.types.Operator):
     def draw(self, context):
         layout = self.layout
         col = layout.column(align=True)
-        col.label(text="即将下载并安装 ComfyUI 及必需模型。", icon='INFO')
+        col.label(text="即将下载并安装 ComfyUI 及必需节点。", icon='INFO')
         col.separator()
-        col.label(text=f"⚠ 预计需要约 25 GB 可用磁盘空间", icon='ERROR')
+        col.label(text=f"⚠ 预计需要约 18 GB 可用磁盘空间；模型需额外空间", icon='ERROR')
         col.label(text="⚠ 需要 NVIDIA GPU (4 GB+ 显存) 才能正常使用", icon='ERROR')
         col.label(text="⚠ 下载可能需要 15~60 分钟（取决于网络）", icon='ERROR')
         col.separator()
@@ -1282,37 +1538,6 @@ class AI_OT_InstallComfyUI(bpy.types.Operator):
         return {'FINISHED'}
 
 
-_download_state = {
-    "thread": None,
-    "status": "",
-}
-
-
-def _poll_download():
-    state = _download_state
-    if state["thread"] is None:
-        return None
-    if state["thread"].is_alive():
-        try:
-            if bpy.context and bpy.context.scene:
-                bpy.context.scene.ai_concept_props.status_message = f"正在下载模型: {state['status']}"
-                log.debug("Model download: %s", state['status'])
-        except Exception:
-            log.debug("Could not update download status (context unavailable)")
-        return 0.5
-    try:
-        if bpy.context and bpy.context.scene:
-            bpy.context.scene.ai_concept_props.status_message = f"下载完成: {state['status']}"
-            log.debug("Model download finished: %s", state['status'])
-    except Exception:
-        log.debug("Could not update download finished status (context unavailable)")
-    for window in bpy.context.window_manager.windows:
-        for area in window.screen.areas:
-            area.tag_redraw()
-    state["thread"] = None
-    return None
-
-
 class AI_OT_DownloadModel(bpy.types.Operator):
     bl_idname = "ai_concept.download_model"
     bl_label = "下载模型"
@@ -1322,11 +1547,6 @@ class AI_OT_DownloadModel(bpy.types.Operator):
     model_id: bpy.props.StringProperty()
 
     def execute(self, context):
-        state = _download_state
-        if state["thread"] and state["thread"].is_alive():
-            self.report({'WARNING'}, "已有下载进行中")
-            return {'CANCELLED'}
-
         prefs = _get_prefs(context)
         comfyui_path = _get_install_path(prefs)
 
@@ -1336,23 +1556,30 @@ class AI_OT_DownloadModel(bpy.types.Operator):
 
         model_id = self.model_id
 
+        if not pref_utils.start_download_state(model_id):
+            self.report({'WARNING'}, "该模型正在下载中")
+            return {'CANCELLED'}
+
         hf_token = prefs.huggingface_token
         use_mirror = getattr(prefs, "use_china_mirror", True)
 
         def progress_cb(phase, progress, message):
-            state["status"] = message
-            log.debug("Download [%s]: %s", phase, message)
+            pref_utils.update_download_state(model_id, progress, message)
+            log.debug("Download [%s] %s: %s", model_id, phase, message)
 
         def worker():
             try:
-                comfyui_installer.download_model(comfyui_path, model_id, progress_cb, hf_token=hf_token, use_mirror=use_mirror)
+                comfyui_installer.download_model(
+                    comfyui_path, model_id, progress_cb,
+                    hf_token=hf_token, use_mirror=use_mirror,
+                )
+                pref_utils.finish_download_state(model_id, "完成")
             except Exception as e:
-                state["status"] = f"Error: {e}"
+                log.exception("Model download failed: %s", model_id)
+                pref_utils.finish_download_state(model_id, f"错误: {e}")
 
-        state["thread"] = threading.Thread(target=worker, daemon=True)
-        state["thread"].start()
-
-        bpy.app.timers.register(_poll_download, first_interval=0.5)
+        threading.Thread(target=worker, daemon=True).start()
+        pref_utils.ensure_download_poll_timer()
         self.report({'INFO'}, f"开始下载模型: {model_id}")
         return {'FINISHED'}
 

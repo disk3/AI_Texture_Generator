@@ -1,10 +1,12 @@
 import bpy
-from typing import Dict
-from PIL import Image
+from typing import Dict, Any
+
+import numpy as np
 
 from .uv_extractor import UVExtractor
 from .shader_builder import ShaderBuilder
 from ..sd_backend.abstract_client import GenerationConfig
+from ..utils.image_utils import numpy_to_blender_image
 
 
 class PBRGenerator:
@@ -27,24 +29,28 @@ class PBRGenerator:
         images: Dict[str, bpy.types.Image] = {}
 
         # Diffuse
-        diffuse_config = self._build_config(props, uv_layout, "seamless texture, highly detailed, diffuse albedo")
+        diffuse_config = self._build_config(
+            props, uv_layout,
+            "seamless texture, highly detailed, diffuse albedo, matte flat color, "
+            "no highlights, no reflections, no specular, no shadows"
+        )
         diffuse_result = self.client.img2img(diffuse_config)
-        images['diffuse'] = self._pil_to_blender_image(diffuse_result.images[0], f"{obj.name}_diffuse")
+        images['diffuse'] = self._np_to_blender_image(np.array(diffuse_result.images[0]), f"{obj.name}_diffuse")
 
         # Normal
         normal_config = self._build_config(props, uv_layout, "normal map, seamless texture")
         normal_result = self.client.img2img(normal_config)
-        images['normal'] = self._pil_to_blender_image(normal_result.images[0], f"{obj.name}_normal")
+        images['normal'] = self._np_to_blender_image(np.array(normal_result.images[0]), f"{obj.name}_normal")
 
         # Roughness
         rough_config = self._build_config(props, uv_layout, "roughness map, grayscale, seamless texture")
         rough_result = self.client.img2img(rough_config)
-        images['roughness'] = self._pil_to_blender_image(rough_result.images[0], f"{obj.name}_roughness")
+        images['roughness'] = self._np_to_blender_image(np.array(rough_result.images[0]), f"{obj.name}_roughness")
 
         # Metallic
         metal_config = self._build_config(props, uv_layout, "metallic map, grayscale, seamless texture")
         metal_result = self.client.img2img(metal_config)
-        images['metallic'] = self._pil_to_blender_image(metal_result.images[0], f"{obj.name}_metallic")
+        images['metallic'] = self._np_to_blender_image(np.array(metal_result.images[0]), f"{obj.name}_metallic")
 
         mat = ShaderBuilder.build_principled_bsdf(f"Mat_{obj.name}_PBR", images)
 
@@ -55,7 +61,7 @@ class PBRGenerator:
 
         return mat
 
-    def _build_config(self, props, init_image: Image.Image, prompt_suffix: str) -> GenerationConfig:
+    def _build_config(self, props, init_image: Any, prompt_suffix: str) -> GenerationConfig:
         # 安全读取属性：CTProperties 中不存在 steps/cfg_scale/sampler/denoising_strength，
         # 使用合理的默认值兼容旧代码路径
         steps = getattr(props, "steps", 25)
@@ -76,16 +82,16 @@ class PBRGenerator:
             denoising_strength=denoising_strength,
         )
 
-    def _pil_to_blender_image(self, pil_img: Image.Image, name: str) -> bpy.types.Image:
-        if pil_img.mode != 'RGBA':
-            pil_img = pil_img.convert('RGBA')
-        blender_img = bpy.data.images.new(name, width=pil_img.size[0], height=pil_img.size[1])
-        resized = pil_img.resize((blender_img.size[0], blender_img.size[1]))
-        # Blender pixels 原点在左下角，PIL 原点在左上角，需垂直翻转才能一致
-        resized = resized.transpose(Image.FLIP_TOP_BOTTOM)
-        pixels = list(resized.getdata())
-        blender_img.pixels = [c / 255.0 for px in pixels for c in px]
+    def _np_to_blender_image(self, arr: np.ndarray, name: str) -> bpy.types.Image:
+        if arr.ndim == 2:
+            arr = np.stack([arr, arr, arr, np.ones_like(arr) * 255], axis=-1)
+        elif arr.shape[-1] == 3:
+            alpha = np.ones((*arr.shape[:2], 1), dtype=np.uint8) * 255
+            arr = np.concatenate([arr, alpha], axis=-1)
+        elif arr.shape[-1] != 4:
+            raise ValueError(f"Unsupported image shape: {arr.shape}")
+
+        blender_img = numpy_to_blender_image(name, arr)
         # 明确指定为 sRGB，避免 3D 视口因线性/非线性解释错误而发灰
         blender_img.colorspace_settings.name = 'sRGB'
-        blender_img.update()
         return blender_img

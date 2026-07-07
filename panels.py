@@ -102,6 +102,16 @@ class AI_PT_TexturePanel(bpy.types.Panel):
         props = context.scene.ai_concept_props
         prefs = _addon_prefs(context)
 
+        runtime_missing = preferences.dependency_missing_for_profile('LOCAL_PBR')
+        if runtime_missing:
+            box = layout.box()
+            box.alert = True
+            box.label(text="基础组件缺失，生成工具暂不可用", icon='ERROR')
+            op = box.operator("ai_concept.repair_dependencies", text="一键修复基础组件", icon='IMPORT')
+            op.profile = 'LOCAL_PBR'
+            box.label(text="修复完成后请重新启用插件或重启 Blender")
+            return
+
         # Generation Backend
         box = layout.box()
         box.label(text="生成后端", icon='PREFERENCES')
