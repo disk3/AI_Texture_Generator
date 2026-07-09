@@ -213,19 +213,16 @@ def _grab_clipboard_with_pil():
         for path in result:
             if os.path.isfile(path):
                 try:
-                    pil_img = Image.open(path)
-                    break
+                    with Image.open(path) as pil_img:
+                        if pil_img.mode != 'RGBA':
+                            pil_img = pil_img.convert('RGBA')
+                        return np.array(pil_img), pil_img.size[0], pil_img.size[1]
                 except Exception as e:
                     log.warning("Cannot open clipboard file %s: %s", path, e)
                     continue
-        else:
-            return None
+        return None
     else:
         return None
-
-    if pil_img.mode != 'RGBA':
-        pil_img = pil_img.convert('RGBA')
-    return np.array(pil_img), pil_img.size[0], pil_img.size[1]
 
 
 def _grab_clipboard_windows_ctypes():
@@ -516,73 +513,35 @@ class AI_OT_OptimizePrompt(bpy.types.Operator):
         expanded = build_texture_prompt(props)
         props.prompt = expanded
 
-    def execute(self, context):
-        props = context.scene.ai_concept_props
-        addon_name = __package__.split('.')[0]
-        prefs = context.preferences.addons[addon_name].preferences
-
-        pref_utils.ensure_default_api_providers(prefs)
-        provider_value = props.texture_generator
-        provider_snapshot = pref_utils.get_selected_api_provider_snapshot(
-            context,
-            provider_value,
-            getattr(props, "api_image_model", "DEFAULT"),
-            "DEFAULT",
-        )
-
-        # 若当前选中的后端不是 API provider，或其 API Key 为空，
-        # 自动回退到任意一个已配置 API Key 的 provider。
-        if not provider_snapshot or not provider_snapshot.get("api_key"):
-            provider_snapshot = pref_utils.find_any_configured_api_provider(prefs, context)
-
-        if not provider_snapshot or not provider_snapshot.get("api_key"):
-            # 无可用 API：回退到本地基于 Material Config 的规则扩展
-            try:
-                self._local_fallback_optimize(props)
-                self.report(
-                    {'INFO'},
-                    "未配置 API，已使用本地规则根据材质配置扩展提示词"
-                )
-            except Exception as e:
-                self.report(
-                    {'ERROR'},
-                    f"未找到可用 API Key，且本地规则扩展失败: {e}"
-                )
-                return {'CANCELLED'}
-            return {'FINISHED'}
-
-        api_key = provider_snapshot["api_key"]
-        base_url = (provider_snapshot.get("base_url") or "").rstrip("/")
-        model = provider_snapshot.get("text_model") or provider_snapshot.get("image_model")
-        protocol = provider_snapshot.get("protocol", "OPENAI_COMPATIBLE")
-
-        original = props.prompt.strip()
-        if not original:
-            self.report({'WARNING'}, "提示词为空，请输入描述后再优化")
-            return {'CANCELLED'}
-
-        system_prompt = (
-            "你是一位专业的 3A 游戏与影视级 PBR 材质纹理提示词工程师。"
-            "请将用户的简单描述扩展成一段高质量、细节极其丰富的材质纹理生成提示词。\n\n"
-            "要求：\n"
-            "1. 保留用户原意，不要改成完全不同的材质。\n"
-            "2. 必须加入以下维度的具体细节描述：\n"
-            "   - 材质类型与宏观特征（如混凝土、金属、石材、木材、织物、土壤、涂层、陶瓷等）；\n"
-            "   - 整体色调、饱和度、冷暖倾向；\n"
-            "   - 表面老化与风化程度（全新、轻微磨损、中度风化、严重腐蚀、陈旧古旧等）；\n"
-            "   - 主要纹理图案（裂纹、划痕、凹坑、凸起、鳞片、纤维、编织、颗粒、层理、孔洞等）；\n"
-            "   - 纹理密度、方向、规律性或随机性分布；\n"
-            "   - 磨损区域、边缘破损、磕碰痕迹、使用痕迹；\n"
-            "   - 污渍、油渍、水渍、锈迹、霉斑、氧化物、沉积物、尘埃覆盖；\n"
-            "   - 表面粗糙度与触感（光滑、磨砂、颗粒感、绒毛感、油腻感、干涩感等）；\n"
-            "   - 反光特性（哑光、半哑光、微光泽、镜面、各向异性、金属高光等）；\n"
-            "   - PBR 技术规范：无缝平铺（seamless tiling）、UV 就绪、正投影俯视、平光照明、无阴影、无高光、无透视变形。\n"
-            "3. 使用中文输出，输出一段连续自然的描述文本，不要加标题、列表、引号或 Markdown。\n"
-            "4. 直接返回优化后的提示词，不要添加任何解释或额外内容。"
-        )
-
+    def _optimize_worker(self, provider_snapshot, original):
+        """后台线程中执行 LLM API 请求。"""
         requests = _requests_module()
         try:
+            api_key = provider_snapshot["api_key"]
+            base_url = (provider_snapshot.get("base_url") or "").rstrip("/")
+            model = provider_snapshot.get("text_model") or provider_snapshot.get("image_model")
+            protocol = provider_snapshot.get("protocol", "OPENAI_COMPATIBLE")
+
+            system_prompt = (
+                "你是一位专业的 3A 游戏与影视级 PBR 材质纹理提示词工程师。"
+                "请将用户的简单描述扩展成一段高质量、细节极其丰富的材质纹理生成提示词。\n\n"
+                "要求：\n"
+                "1. 保留用户原意，不要改成完全不同的材质。\n"
+                "2. 必须加入以下维度的具体细节描述：\n"
+                "   - 材质类型与宏观特征（如混凝土、金属、石材、木材、织物、土壤、涂层、陶瓷等）；\n"
+                "   - 整体色调、饱和度、冷暖倾向；\n"
+                "   - 表面老化与风化程度（全新、轻微磨损、中度风化、严重腐蚀、陈旧古旧等）；\n"
+                "   - 主要纹理图案（裂纹、划痕、凹坑、凸起、鳞片、纤维、编织、颗粒、层理、孔洞等）；\n"
+                "   - 纹理密度、方向、规律性或随机性分布；\n"
+                "   - 磨损区域、边缘破损、磕碰痕迹、使用痕迹；\n"
+                "   - 污渍、油渍、水渍、锈迹、霉斑、氧化物、沉积物、尘埃覆盖；\n"
+                "   - 表面粗糙度与触感（光滑、磨砂、颗粒感、绒毛感、油腻感、干涩感等）；\n"
+                "   - 反光特性（哑光、半哑光、微光泽、镜面、各向异性、金属高光等）；\n"
+                "   - PBR 技术规范：无缝平铺（seamless tiling）、UV 就绪、正投影俯视、平光照明、无阴影、无高光、无透视变形。\n"
+                "3. 使用中文输出，输出一段连续自然的描述文本，不要加标题、列表、引号或 Markdown。\n"
+                "4. 直接返回优化后的提示词，不要添加任何解释或额外内容。"
+            )
+
             if protocol == 'GEMINI':
                 # SECURITY: Gemini API Key 要求通过 URL query param 传递 API Key。
                 # Key 可能被中间代理 / CDN / 服务端日志记录。
@@ -631,16 +590,76 @@ class AI_OT_OptimizePrompt(bpy.types.Operator):
                     raise ValueError("API 返回空 choices")
                 message = choices[0].get("message") or {}
                 optimized = message.get("content", "").strip()
-            props.prompt = optimized
-            self.report({'INFO'}, "提示词已优化")
+            self._result = optimized
         except requests.exceptions.ReadTimeout:
-            self.report({'ERROR'}, f"优化失败: {provider_snapshot.get('name', 'API')} 响应超时。/models 测试通过只代表模型列表可访问；请检查 Default Text Model 是否支持 chat/completions，或稍后重试。")
+            self._error = f"优化失败: {provider_snapshot.get('name', 'API')} 响应超时。/models 测试通过只代表模型列表可访问；请检查 Default Text Model 是否支持 chat/completions，或稍后重试。"
         except requests.exceptions.HTTPError as e:
-            self.report({'ERROR'}, f"API 错误: {e}")
+            self._error = f"API 错误: {e}"
         except Exception as e:
-            self.report({'ERROR'}, f"优化失败: {e}")
+            self._error = f"优化失败: {e}"
 
+    def modal(self, context, event):
+        """轮询后台线程状态并写入结果。"""
+        if self._thread.is_alive():
+            return {'PASS_THROUGH'}
+        self._thread.join()
+        if self._error is not None:
+            self.report({'ERROR'}, str(self._error))
+            return {'CANCELLED'}
+        context.scene.ai_concept_props.prompt = self._result
+        self.report({'INFO'}, "提示词已优化")
         return {'FINISHED'}
+
+    def execute(self, context):
+        props = context.scene.ai_concept_props
+        addon_name = __package__.split('.')[0]
+        prefs = context.preferences.addons[addon_name].preferences
+
+        pref_utils.ensure_default_api_providers(prefs)
+        provider_value = props.texture_generator
+        provider_snapshot = pref_utils.get_selected_api_provider_snapshot(
+            context,
+            provider_value,
+            getattr(props, "api_image_model", "DEFAULT"),
+            "DEFAULT",
+        )
+
+        # 若当前选中的后端不是 API provider，或其 API Key 为空，
+        # 自动回退到任意一个已配置 API Key 的 provider。
+        if not provider_snapshot or not provider_snapshot.get("api_key"):
+            provider_snapshot = pref_utils.find_any_configured_api_provider(prefs, context)
+
+        if not provider_snapshot or not provider_snapshot.get("api_key"):
+            # 无可用 API：回退到本地基于 Material Config 的规则扩展
+            try:
+                self._local_fallback_optimize(props)
+                self.report(
+                    {'INFO'},
+                    "未配置 API，已使用本地规则根据材质配置扩展提示词"
+                )
+            except Exception as e:
+                self.report(
+                    {'ERROR'},
+                    f"未找到可用 API Key，且本地规则扩展失败: {e}"
+                )
+                return {'CANCELLED'}
+            return {'FINISHED'}
+
+        original = props.prompt.strip()
+        if not original:
+            self.report({'WARNING'}, "提示词为空，请输入描述后再优化")
+            return {'CANCELLED'}
+
+        self._result = None
+        self._error = None
+        self._thread = threading.Thread(
+            target=self._optimize_worker,
+            args=(provider_snapshot, original),
+            daemon=True,
+        )
+        self._thread.start()
+        context.window_manager.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
 
 class AI_OT_OpenImageFolder(bpy.types.Operator):
     """在文件浏览器中打开贴图所在文件夹。"""
@@ -1083,9 +1102,11 @@ class AI_OT_CaptionReferenceImage(bpy.types.Operator):
         if json_match:
             text = json_match.group(0)
 
+        if not isinstance(text, str):
+            return text
         try:
             data = json.loads(text)
-        except Exception:
+        except json.JSONDecodeError:
             # 解析失败则直接返回原文本
             return text
 
@@ -1105,41 +1126,15 @@ class AI_OT_CaptionReferenceImage(bpy.types.Operator):
 
         return "，".join(parts)
 
-    def execute(self, context):
-        props = context.scene.ai_concept_props
-        addon_name = __package__.split('.')[0]
-        prefs = context.preferences.addons[addon_name].preferences
-
-        if not props.reference_image:
-            self.report({'ERROR'}, "请先加载参考图")
-            return {'CANCELLED'}
-
-        provider_snapshot = self._get_provider_snapshot(context, prefs)
-        if not provider_snapshot or not provider_snapshot.get("api_key"):
-            self.report(
-                {'ERROR'},
-                "反推提示词需要视觉模型 API。请在 Preferences 中配置 API Provider，"
-                "或本地运行 Ollama（OpenAI 兼容端点 http://localhost:11434/v1）后添加为 Provider"
-            )
-            return {'CANCELLED'}
-
-        api_key = provider_snapshot["api_key"]
-        base_url = (provider_snapshot.get("base_url") or "").rstrip("/")
-        model = provider_snapshot.get("vision_model") or provider_snapshot.get("text_model") or provider_snapshot.get("image_model")
-        protocol = provider_snapshot.get("protocol", "OPENAI_COMPATIBLE")
-
-        if not model:
-            self.report({'ERROR'}, "未找到可用的视觉模型，请先在 Preferences 中设置 Default Vision Model")
-            return {'CANCELLED'}
-
-        try:
-            b64 = self._image_to_base64(props.reference_image)
-        except Exception as e:
-            self.report({'ERROR'}, f"参考图转换失败: {e}")
-            return {'CANCELLED'}
-
+    def _caption_worker(self, provider_snapshot, b64):
+        """后台线程中执行视觉模型 API 请求并生成完整提示词。"""
         requests = _requests_module()
         try:
+            api_key = provider_snapshot["api_key"]
+            base_url = (provider_snapshot.get("base_url") or "").rstrip("/")
+            model = provider_snapshot.get("vision_model") or provider_snapshot.get("text_model") or provider_snapshot.get("image_model")
+            protocol = provider_snapshot.get("protocol", "OPENAI_COMPATIBLE")
+
             if protocol == 'GEMINI':
                 # SECURITY: Gemini API Key 通过 URL query param 传递，见上文说明。
                 gemini_base = base_url if base_url.endswith("/v1beta") else f"{base_url}/v1beta"
@@ -1201,24 +1196,69 @@ class AI_OT_CaptionReferenceImage(bpy.types.Operator):
 
             caption = self._parse_caption_json(raw_text)
             if not caption:
-                self.report({'ERROR'}, "模型返回空提示词")
-                return {'CANCELLED'}
+                self._error = "模型返回空提示词"
+                return
 
             # 追加 PBR 技术后缀
-            full_prompt = f"{caption}。{self.PBR_SUFFIX}"
-            props.prompt = full_prompt
-            self.report({'INFO'}, "参考图提示词已生成")
+            self._result = f"{caption}。{self.PBR_SUFFIX}"
         except requests.exceptions.ReadTimeout:
-            self.report({'ERROR'}, "反推超时，请稍后重试")
-            return {'CANCELLED'}
+            self._error = "反推超时，请稍后重试"
         except requests.exceptions.HTTPError as e:
-            self.report({'ERROR'}, f"API 错误: {e}")
-            return {'CANCELLED'}
+            self._error = f"API 错误: {e}"
         except Exception as e:
-            self.report({'ERROR'}, f"反推失败: {e}")
+            self._error = f"反推失败: {e}"
+
+    def modal(self, context, event):
+        """轮询后台线程状态并写入结果。"""
+        if self._thread.is_alive():
+            return {'PASS_THROUGH'}
+        self._thread.join()
+        if self._error is not None:
+            self.report({'ERROR'}, str(self._error))
+            return {'CANCELLED'}
+        context.scene.ai_concept_props.prompt = self._result
+        self.report({'INFO'}, "参考图提示词已生成")
+        return {'FINISHED'}
+
+    def execute(self, context):
+        props = context.scene.ai_concept_props
+        addon_name = __package__.split('.')[0]
+        prefs = context.preferences.addons[addon_name].preferences
+
+        if not props.reference_image:
+            self.report({'ERROR'}, "请先加载参考图")
             return {'CANCELLED'}
 
-        return {'FINISHED'}
+        provider_snapshot = self._get_provider_snapshot(context, prefs)
+        if not provider_snapshot or not provider_snapshot.get("api_key"):
+            self.report(
+                {'ERROR'},
+                "反推提示词需要视觉模型 API。请在 Preferences 中配置 API Provider，"
+                "或本地运行 Ollama（OpenAI 兼容端点 http://localhost:11434/v1）后添加为 Provider"
+            )
+            return {'CANCELLED'}
+
+        model = provider_snapshot.get("vision_model") or provider_snapshot.get("text_model") or provider_snapshot.get("image_model")
+        if not model:
+            self.report({'ERROR'}, "未找到可用的视觉模型，请先在 Preferences 中设置 Default Vision Model")
+            return {'CANCELLED'}
+
+        try:
+            b64 = self._image_to_base64(props.reference_image)
+        except Exception as e:
+            self.report({'ERROR'}, f"参考图转换失败: {e}")
+            return {'CANCELLED'}
+
+        self._result = None
+        self._error = None
+        self._thread = threading.Thread(
+            target=self._caption_worker,
+            args=(provider_snapshot, b64),
+            daemon=True,
+        )
+        self._thread.start()
+        context.window_manager.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
 
 
 class AI_OT_EditPromptInTextEditor(bpy.types.Operator):
@@ -1437,9 +1477,6 @@ class AI_MT_ReferenceImageMenu(bpy.types.Menu):
 # ComfyUI 获取 / 模型下载页
 # =============================================================================
 
-COMFYUI_DOWNLOAD_URL = "https://comfy.org/zh-CN/download"
-
-
 def _get_prefs(context):
     addon_pkg = __package__.split('.')[0]
     return context.preferences.addons[addon_pkg].preferences
@@ -1447,19 +1484,6 @@ def _get_prefs(context):
 
 def _get_install_path(prefs):
     return prefs.comfyui_path or comfyui_installer.get_default_install_path()
-
-
-class AI_OT_GetComfyUI(bpy.types.Operator):
-    bl_idname = "ai_concept.get_comfyui"
-    bl_label = "获取 ComfyUI"
-    bl_description = "打开 ComfyUI 官方下载页面，按指引下载安装"
-    bl_options = {'REGISTER'}
-
-    def execute(self, context):
-        import webbrowser
-        webbrowser.open(COMFYUI_DOWNLOAD_URL)
-        self.report({'INFO'}, "已在浏览器打开 ComfyUI 下载页面")
-        return {'FINISHED'}
 
 
 class AI_OT_OpenModelDownloadPage(bpy.types.Operator):
@@ -1506,7 +1530,6 @@ classes = [
     AI_OT_ApplyPromptFromTextEditor,
     AI_PT_PromptEditorPanel,
     AI_MT_ReferenceImageMenu,
-    AI_OT_GetComfyUI,
     AI_OT_OpenModelDownloadPage,
 ]
 

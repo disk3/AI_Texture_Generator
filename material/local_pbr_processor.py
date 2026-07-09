@@ -12,7 +12,6 @@ import math
 import numpy as np
 
 from ..utils.image_utils import resize_numpy_image
-from .seamless_processor import make_seamless_tile_local
 
 
 # =============================================================================
@@ -94,7 +93,7 @@ def _box_blur_channel(channel: np.ndarray, radius: int, edge_mode: str = "edge")
     """单通道积分图盒式模糊，保持平均亮度。"""
     if radius <= 0:
         return channel.copy()
-    mean_before = np.mean(channel) or 1e-8
+    mean_before = max(float(np.mean(channel)), 1e-8)
 
     if edge_mode == "wrap":
         padded = np.pad(channel, radius, mode="wrap")
@@ -111,7 +110,7 @@ def _box_blur_channel(channel: np.ndarray, radius: int, edge_mode: str = "edge")
 
     area = (2 * radius + 1) ** 2
     blurred = col_window / area
-    mean_after = np.mean(blurred) or 1e-8
+    mean_after = max(float(np.mean(blurred)), 1e-8)
     blurred = blurred * (mean_before / mean_after)
     return np.clip(blurred, 0.0, 1.0).astype(np.float32)
 

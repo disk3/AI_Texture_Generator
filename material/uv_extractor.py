@@ -131,17 +131,6 @@ class UVExtractor:
             error_messages=messages,
         )
 
-    def select_problematic_faces(self, obj: bpy.types.Object, face_indices: List[int]):
-        bpy.context.view_layer.objects.active = obj
-        bpy.ops.object.mode_set(mode='EDIT')
-        bpy.ops.mesh.select_all(action='DESELECT')
-        bm = bmesh.from_edit_mesh(obj.data)
-        bm.faces.ensure_lookup_table()
-        for idx in face_indices:
-            if idx < len(bm.faces):
-                bm.faces[idx].select = True
-        bmesh.update_edit_mesh(obj.data)
-
     def render_uv_layout(self, obj: bpy.types.Object, image_size: int = 1024) -> np.ndarray:
         """渲染 UV 布局图为 numpy RGB 数组。"""
         uv_layer = obj.data.uv_layers.active

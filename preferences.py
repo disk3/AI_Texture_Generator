@@ -3,6 +3,7 @@ import time
 import os
 import sys
 import importlib
+import threading
 
 from .sd_backend import comfyui_installer
 from .ui import icons as icon_manager
@@ -12,6 +13,124 @@ log = get_logger(__name__)
 
 API_PROVIDER_PREFIX = "API:"
 MAX_PANEL_IMAGE_MODELS = 8
+KEYRING_SERVICE_NAME = "AI_Texture_Generator/APIKeys"
+API_KEY_PLACEHOLDER = "********"
+COMFYUI_DOWNLOAD_URL = "https://comfy.org/zh-CN/download"
+
+
+def _get_keyring_service() -> str:
+    return KEYRING_SERVICE_NAME
+
+
+def _keyring_available() -> bool:
+    try:
+        import keyring
+        return True
+    except Exception:
+        return False
+
+
+def _keyring_module():
+    import keyring
+    return keyring
+
+
+def find_api_provider(prefs, provider_id: str):
+    for provider in prefs.api_providers:
+        if provider.provider_id == provider_id:
+            return provider
+    return None
+
+
+def get_api_key(provider_id: str) -> str:
+    """读取 API Key。优先从系统密钥环读取；keyring 不可用时回退到 Blender 偏好明文。"""
+    if not provider_id:
+        return ""
+    if _keyring_available():
+        try:
+            kr = _keyring_module()
+            value = kr.get_password(_get_keyring_service(), provider_id)
+            if value:
+                return value
+            # keyring 可用但无记录：尝试把 Blender 偏好中的明文密钥迁移到 keyring
+            try:
+                addon_pkg = __package__.split('.')[0]
+                addon = bpy.context.preferences.addons.get(addon_pkg)
+                if addon:
+                    provider = find_api_provider(addon.preferences, provider_id)
+                    if provider:
+                        plain = provider.api_key or ""
+                        if plain and plain != API_KEY_PLACEHOLDER:
+                            if set_api_key(provider_id, plain):
+                                provider.api_key = API_KEY_PLACEHOLDER
+                                return plain
+            except Exception as e:
+                log.debug("Failed to migrate API key to keyring: %s", e)
+            return ""
+        except Exception as e:
+            log.debug("Failed to read API key from keyring: %s", e)
+            return ""
+    # Fallback: 未安装 keyring 时从 Blender 偏好读取明文
+    try:
+        addon_pkg = __package__.split('.')[0]
+        addon = bpy.context.preferences.addons.get(addon_pkg)
+        if not addon:
+            return ""
+        provider = find_api_provider(addon.preferences, provider_id)
+        if not provider:
+            return ""
+        value = provider.api_key or ""
+        return "" if value == API_KEY_PLACEHOLDER else value
+    except Exception:
+        return ""
+
+
+def set_api_key(provider_id: str, api_key: str) -> bool:
+    """将 API Key 写入系统密钥环。keyring 不可用时返回 False。"""
+    if not provider_id or not api_key:
+        return False
+    if not _keyring_available():
+        return False
+    try:
+        kr = _keyring_module()
+        kr.set_password(_get_keyring_service(), provider_id, api_key)
+        return True
+    except Exception as e:
+        log.warning("Failed to write API key to keyring: %s", e)
+        return False
+
+
+def delete_api_key(provider_id: str) -> bool:
+    """从系统密钥环删除 API Key。"""
+    if not provider_id:
+        return False
+    if not _keyring_available():
+        return False
+    try:
+        kr = _keyring_module()
+        kr.delete_password(_get_keyring_service(), provider_id)
+        return True
+    except Exception as e:
+        log.debug("Failed to delete API key from keyring: %s", e)
+        return False
+
+
+def _new_provider_id(prefix: str = "custom") -> str:
+    return f"{prefix}_{int(time.time() * 1000)}"
+
+
+def _on_api_key_changed(self, context):
+    """API Key 输入框 update 回调：将真实密钥转存到系统密钥环，UI 仅保留占位符。"""
+    if not self.provider_id:
+        self.provider_id = _new_provider_id("api")
+    if not self.api_key:
+        delete_api_key(self.provider_id)
+        return
+    if self.api_key == API_KEY_PLACEHOLDER:
+        return
+    if _keyring_available() and set_api_key(self.provider_id, self.api_key):
+        self.api_key = API_KEY_PLACEHOLDER
+    # keyring 不可用时保留明文（fallback），由 UI 提示用户
 
 DEPENDENCY_PROFILES = {
     'LOCAL_PBR': [
@@ -20,6 +139,7 @@ DEPENDENCY_PROFILES = {
     'API': [
         ("PIL", "Pillow", "图像解码增强"),
         ("requests", "requests", "API 通信增强"),
+        ("keyring", "keyring", "系统密钥环（安全存储 API Key）"),
     ],
     'COMFYUI': [
         ("PIL", "Pillow", "图像解码增强"),
@@ -129,17 +249,17 @@ class AIAPIProviderItem(bpy.types.PropertyGroup):
         ],
         default='OPENAI_COMPATIBLE',
     )
-    api_key: bpy.props.StringProperty(name="API Key", subtype='PASSWORD')
+    api_key: bpy.props.StringProperty(
+        name="API Key",
+        subtype='PASSWORD',
+        update=_on_api_key_changed,
+    )
     base_url: bpy.props.StringProperty(name="Base URL", default="https://api.openai.com/v1")
     default_image_model: bpy.props.StringProperty(name="默认图像模型", default="gpt-image-2")
     default_text_model: bpy.props.StringProperty(name="默认文本模型", default="gpt-5.5")
     default_vision_model: bpy.props.StringProperty(name="默认视觉模型", default="")
     models: bpy.props.CollectionProperty(type=AIAPIModelItem)
     active_model_index: bpy.props.IntProperty(name="Active Model", default=0)
-
-
-def _new_provider_id(prefix: str = "custom") -> str:
-    return f"{prefix}_{int(time.time() * 1000)}"
 
 
 def _provider_value(provider_id: str) -> str:
@@ -152,13 +272,6 @@ def is_api_provider_value(value: str) -> bool:
 
 def provider_id_from_value(value: str) -> str:
     return value[len(API_PROVIDER_PREFIX):] if is_api_provider_value(value) else ""
-
-
-def find_api_provider(prefs, provider_id: str):
-    for provider in prefs.api_providers:
-        if provider.provider_id == provider_id:
-            return provider
-    return None
 
 
 def selected_model_or_default(selected: str, default: str) -> str:
@@ -314,7 +427,7 @@ def find_any_configured_api_provider(prefs, context) -> dict | None:
     if not prefs.api_providers:
         return None
     for provider in prefs.api_providers:
-        if not provider.api_key:
+        if not get_api_key(provider.provider_id):
             continue
         candidate = get_selected_api_provider_snapshot(
             context,
@@ -336,7 +449,7 @@ def get_selected_api_provider_snapshot(context, provider_value: str, image_model
         "provider_id": provider.provider_id,
         "name": provider.name,
         "protocol": provider.protocol,
-        "api_key": provider.api_key,
+        "api_key": get_api_key(provider.provider_id),
         "base_url": provider.base_url,
         "image_model": selected_model_or_default(image_model_selection, provider.default_image_model),
         "text_model": selected_model_or_default(text_model_selection, provider.default_text_model),
@@ -353,12 +466,49 @@ class AI_OT_TestProviderConnection(bpy.types.Operator):
     provider: bpy.props.StringProperty(default='COMFYUI')
 
     def execute(self, context):
-        requests = _requests_module()
-
         addon_pkg = __package__.split('.')[0]
         prefs = context.preferences.addons[addon_pkg].preferences
 
+        if self.provider == 'COMFYUI':
+            if not prefs.comfyui_url.rstrip("/"):
+                self.report({'ERROR'}, "ComfyUI URL 为空")
+                return {'CANCELLED'}
+        elif is_api_provider_value(self.provider):
+            ensure_default_api_providers(prefs)
+            provider = find_api_provider(prefs, provider_id_from_value(self.provider))
+            if not provider:
+                self.report({'ERROR'}, "未找到 API Provider")
+                return {'CANCELLED'}
+            if not get_api_key(provider.provider_id):
+                self.report({'ERROR'}, f"{provider.name} API Key 为空")
+                return {'CANCELLED'}
+        else:
+            self.report({'ERROR'}, f"未知的 Provider 类型: {self.provider}")
+            return {'CANCELLED'}
+
+        self._result = {}
+        self._error = None
+        self._thread = threading.Thread(target=self._test_worker, args=(context,), daemon=True)
+        self._thread.start()
+        context.window_manager.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        if self._thread.is_alive():
+            return {'PASS_THROUGH'}
+        self._thread.join()
+        if self._error is not None:
+            self.report({'ERROR'}, str(self._error))
+            return {'CANCELLED'}
+        self.report({self._result["level"]}, self._result["message"])
+        return {self._result["status"]}
+
+    def _test_worker(self, context):
         try:
+            requests = _requests_module()
+            addon_pkg = __package__.split('.')[0]
+            prefs = context.preferences.addons[addon_pkg].preferences
+
             if self.provider == 'COMFYUI':
                 url = prefs.comfyui_url.rstrip("/")
                 install_path = prefs.comfyui_path or comfyui_installer.get_default_install_path()
@@ -368,35 +518,42 @@ class AI_OT_TestProviderConnection(bpy.types.Operator):
                 from .sd_backend import workflow_specs as _wf_specs
                 client = ComfyUIClient(base_url=url)
 
-                # 本地已安装：尝试连接；桌面版不自动启动，需要用户先打开 Desktop 应用
                 if ctype:
                     if ctype == "desktop":
-                        self.report({'INFO'}, f"正在测试 ComfyUI Desktop 连接 ({url})...")
                         if not client.check_health():
-                            self.report(
-                                {'ERROR'},
-                                f"ComfyUI Desktop 未在 {url} 响应。请先启动 ComfyUI Desktop，"
-                                f"并确认偏好设置中的 URL 与其监听地址一致。",
-                            )
-                            return {'CANCELLED'}
+                            self._result = {
+                                "status": "CANCELLED",
+                                "level": "ERROR",
+                                "message": f"ComfyUI Desktop 未在 {url} 响应。请先启动 ComfyUI Desktop，并确认偏好设置中的 URL 与其监听地址一致。",
+                            }
+                            return
                     else:
-                        self.report({'INFO'}, f"正在测试 ComfyUI {ctype} 连接，必要时将自动启动...")
                         if not client.check_health(auto_launch_path=install_path):
-                            self.report({'ERROR'}, f"ComfyUI {ctype} 启动或连接失败，请检查安装与日志: {install_path}")
-                            return {'CANCELLED'}
+                            self._result = {
+                                "status": "CANCELLED",
+                                "level": "ERROR",
+                                "message": f"ComfyUI {ctype} 启动或连接失败，请检查安装与日志: {install_path}",
+                            }
+                            return
                 else:
-                    # 本地未安装时，探测 URL 是否已有运行实例
                     try:
                         resp = requests.get(f"{url}/system_stats", timeout=(3, 10))
                         resp.raise_for_status()
                     except requests.exceptions.ReadTimeout:
-                        self.report({'WARNING'}, f"{url} 已连接但响应读取超时，ComfyUI 可能正在初始化，请稍后再试")
-                        return {'CANCELLED'}
+                        self._result = {
+                            "status": "CANCELLED",
+                            "level": "WARNING",
+                            "message": f"{url} 已连接但响应读取超时，ComfyUI 可能正在初始化，请稍后再试",
+                        }
+                        return
                     except Exception as e:
-                        self.report({'ERROR'}, f"未检测到 ComfyUI 安装，且 {url} 无法连接: {e}")
-                        return {'CANCELLED'}
+                        self._result = {
+                            "status": "CANCELLED",
+                            "level": "ERROR",
+                            "message": f"未检测到 ComfyUI 安装，且 {url} 无法连接: {e}",
+                        }
+                        return
 
-                # 连接可达后，先按模型族所需的最低核心版本做快速判断
                 props = getattr(context.scene, "ai_concept_props", None)
                 family_id = getattr(props, "local_comfyui_family", "zimage") if props else "zimage"
                 core_version = client.get_comfyui_core_version()
@@ -405,60 +562,66 @@ class AI_OT_TestProviderConnection(bpy.types.Operator):
                     min_version = tuple(int(x) for x in min_version_str.split(".") if x.isdigit())
                     if len(min_version) >= 2 and core_version < min_version:
                         actual_str = ".".join(str(x) for x in core_version)
-                        self.report(
-                            {'ERROR'},
-                            f"当前 ComfyUI 核心版本为 {actual_str}，但模型族 '{family_id}' "
-                            f"需要核心版本 {min_version_str}+。\n"
-                            "请先升级 ComfyUI 核心；若使用 ComfyUI Desktop，"
-                            "请在应用内更新核心版本（应用版本号不等于核心版本）。",
-                        )
-                        return {'CANCELLED'}
+                        self._result = {
+                            "status": "CANCELLED",
+                            "level": "ERROR",
+                            "message": f"当前 ComfyUI 核心版本为 {actual_str}，但模型族 '{family_id}' 需要核心版本 {min_version_str}+。\n请先升级 ComfyUI 核心；若使用 ComfyUI Desktop，请在应用内更新核心版本（应用版本号不等于核心版本）。",
+                        }
+                        return
 
-                # 校验当前模型族 workflow 所需节点完整性
                 missing = client.check_workflow_nodes(family_id=family_id)
                 if missing:
                     lines = [f"{cls_type} ({hint})" if hint else cls_type for _nid, cls_type, hint in missing]
-                    self.report(
-                        {'ERROR'},
-                        f"ComfyUI 缺少当前模型族 ({family_id}) 所需节点:\n" + "\n".join(lines[:8]),
-                    )
-                    return {'CANCELLED'}
+                    self._result = {
+                        "status": "CANCELLED",
+                        "level": "ERROR",
+                        "message": f"ComfyUI 缺少当前模型族 ({family_id}) 所需节点:\n" + "\n".join(lines[:8]),
+                    }
+                    return
 
                 ver_str = ".".join(str(x) for x in core_version) if core_version else "未知"
-                self.report({'INFO'}, f"ComfyUI 连接正常 (核心版本 {ver_str}) 且节点完整 ({family_id}): {url}")
-                return {'FINISHED'}
+                self._result = {
+                    "status": "FINISHED",
+                    "level": "INFO",
+                    "message": f"ComfyUI 连接正常 (核心版本 {ver_str}) 且节点完整 ({family_id}): {url}",
+                }
+                return
 
             if is_api_provider_value(self.provider):
-                ensure_default_api_providers(prefs)
                 provider = find_api_provider(prefs, provider_id_from_value(self.provider))
-                if not provider:
-                    self.report({'ERROR'}, "未找到 API Provider")
-                    return {'CANCELLED'}
-                if not provider.api_key:
-                    self.report({'ERROR'}, f"{provider.name} API Key 为空")
-                    return {'CANCELLED'}
+                api_key = get_api_key(provider.provider_id)
                 if provider.protocol == 'GEMINI':
                     # SECURITY: Gemini API Key 通过 URL query param 传递
                     url = AI_OT_FetchModels._models_url(provider.base_url, "gemini")
-                    resp = requests.get(f"{url}?key={provider.api_key}", timeout=10)
+                    resp = requests.get(f"{url}?key={api_key}", timeout=10)
                 else:
                     url = AI_OT_FetchModels._models_url(provider.base_url, "openai")
                     resp = requests.get(
                         url,
-                        headers=AI_OT_FetchModels._model_headers(provider.api_key, "openai"),
+                        headers=AI_OT_FetchModels._model_headers(api_key, "openai"),
                         timeout=10,
                     )
                 if resp.status_code >= 400:
-                    self.report({'WARNING'}, f"{provider.name} /models 返回 HTTP {resp.status_code}")
-                    return {'FINISHED'}
-                self.report({'INFO'}, f"{provider.name} /models 响应正常。生成/对话端点可能需要配置正确的默认模型。")
-                return {'FINISHED'}
+                    self._result = {
+                        "status": "FINISHED",
+                        "level": "WARNING",
+                        "message": f"{provider.name} /models 返回 HTTP {resp.status_code}",
+                    }
+                    return
+                self._result = {
+                    "status": "FINISHED",
+                    "level": "INFO",
+                    "message": f"{provider.name} /models 响应正常。生成/对话端点可能需要配置正确的默认模型。",
+                }
+                return
 
+            self._result = {
+                "status": "CANCELLED",
+                "level": "ERROR",
+                "message": f"未知的 Provider 类型: {self.provider}",
+            }
         except Exception as e:
-            self.report({'ERROR'}, f"连接测试失败: {e}")
-            return {'CANCELLED'}
-
-        return {'CANCELLED'}
+            self._error = f"连接测试失败: {e}"
 
 
 class AI_OT_AddAPIProvider(bpy.types.Operator):
@@ -707,14 +870,14 @@ class AI_OT_FetchModels(bpy.types.Operator):
 
     def _handle_fetch(self, provider):
         """根据 provider 协议选择正确的拉取策略，返回 (models_list, message)。"""
+        api_key = get_api_key(provider.provider_id)
         if provider.protocol == 'GEMINI':
             base_url = provider.base_url
-            api_key = provider.api_key
             models = self._fetch_gemini_models(base_url, api_key)
             msg = f"Gemini /v1beta/models 返回 {len(models)} 个模型"
         else:
             url = self._models_url(provider.base_url, "openai")
-            models = self._fetch_openai_models(url, provider.api_key)
+            models = self._fetch_openai_models(url, api_key)
             msg = f"OpenAI-compatible /v1/models 返回 {len(models)} 个模型"
         return models, msg
 
@@ -734,22 +897,48 @@ class AI_OT_FetchModels(bpy.types.Operator):
         if not provider:
             self.report({'ERROR'}, "未找到 API Provider")
             return {'CANCELLED'}
-        if not provider.api_key:
+        if not get_api_key(provider.provider_id):
             self.report({'ERROR'}, f"{provider.name} API Key 为空")
             return {'CANCELLED'}
 
-        try:
-            models, msg = self._handle_fetch(provider)
-        except Exception as e:
+        self._result = None
+        self._error = None
+        self._thread = threading.Thread(target=self._fetch_worker, args=(provider,), daemon=True)
+        self._thread.start()
+        context.window_manager.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        if self._thread.is_alive():
+            return {'PASS_THROUGH'}
+        self._thread.join()
+
+        addon_pkg = __package__.split('.')[0]
+        prefs = context.preferences.addons[addon_pkg].preferences
+        provider = None
+        if self.provider_id:
+            provider = find_api_provider(prefs, self.provider_id)
+        elif 0 <= self.provider_index < len(prefs.api_providers):
+            provider = prefs.api_providers[self.provider_index]
+        elif 0 <= prefs.active_api_provider_index < len(prefs.api_providers):
+            provider = prefs.api_providers[prefs.active_api_provider_index]
+
+        if not provider:
+            self.report({'ERROR'}, "未找到 API Provider")
+            return {'CANCELLED'}
+
+        if self._error is not None:
             if "modelscope" in provider.base_url.lower():
                 models = self.MODELSCOPE_DEFAULT_MODELS
-                msg = f"ModelScope 拉取失败 ({e})，已使用内置默认模型列表"
+                msg = f"ModelScope 拉取失败 ({self._error})，已使用内置默认模型列表"
             elif provider.protocol == 'GEMINI':
                 models = self.DEFAULT_GEMINI_MODELS
-                msg = f"Gemini 拉取失败 ({e})，已使用默认模型列表"
+                msg = f"Gemini 拉取失败 ({self._error})，已使用默认模型列表"
             else:
                 models = self.DEFAULT_OPENAI_MODELS
-                msg = f"{provider.name} 拉取失败 ({e})，已使用默认模型列表"
+                msg = f"{provider.name} 拉取失败 ({self._error})，已使用默认模型列表"
+        else:
+            models, msg = self._result
 
         provider.models.clear()
         vision_candidates = []
@@ -761,7 +950,6 @@ class AI_OT_FetchModels(bpy.types.Operator):
             if self._is_vision_model(model_id):
                 vision_candidates.append(model_id)
 
-        # 自动选择最佳默认模型
         self._auto_select_best_models(provider, models, vision_candidates)
 
         info_msg = f"{provider.name}: {msg}，已记录 {len(provider.models)} 个模型"
@@ -776,6 +964,12 @@ class AI_OT_FetchModels(bpy.types.Operator):
                 area.tag_redraw()
 
         return {'FINISHED'}
+
+    def _fetch_worker(self, provider):
+        try:
+            self._result = self._handle_fetch(provider)
+        except Exception as e:
+            self._error = str(e)
 
 
 class AI_OT_RefreshComfyUIModels(bpy.types.Operator):
@@ -807,6 +1001,20 @@ class AI_OT_RefreshComfyUIModels(bpy.types.Operator):
         for window in context.window_manager.windows:
             for area in window.screen.areas:
                 area.tag_redraw()
+        return {'FINISHED'}
+
+
+class AI_OT_GetComfyUI(bpy.types.Operator):
+    """打开 ComfyUI 官方下载页面。"""
+    bl_idname = "ai_concept.get_comfyui"
+    bl_label = "获取 ComfyUI"
+    bl_description = "打开 ComfyUI 官方下载页面，按指引下载安装"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        import webbrowser
+        webbrowser.open(COMFYUI_DOWNLOAD_URL)
+        self.report({'INFO'}, "已在浏览器打开 ComfyUI 下载页面")
         return {'FINISHED'}
 
 
@@ -846,11 +1054,17 @@ class AI_OT_RepairDependencies(bpy.types.Operator):
 
         ok, msg = addon_mod._auto_install_dependencies(missing_display, verifier=verifier)
         if ok:
-            if self.profile in {'LOCAL_PBR', 'ALL'}:
-                msg += "。基础组件修复后请重新启用插件或重启 Blender。"
-            self.report({'INFO'}, msg)
+            # 安装成功后立即把 vendor 目录注入 sys.path，尝试不重启就加载新依赖
+            if hasattr(addon_mod, "_inject_vendor_site"):
+                addon_mod._inject_vendor_site()
+            self.report({'INFO'}, f"{msg} 组件已安装并尝试加载，如 UI 仍未更新请重新启用插件或重启 Blender。")
+            for window in context.window_manager.windows:
+                for area in window.screen.areas:
+                    area.tag_redraw()
             return {'FINISHED'}
-        self.report({'ERROR'}, msg)
+        # 把详细错误输出截断到合理长度再 report
+        report_msg = msg if len(msg) < 512 else msg[:512] + "..."
+        self.report({'ERROR'}, f"组件安装失败：{report_msg}")
         return {'CANCELLED'}
 
 
@@ -872,55 +1086,6 @@ class CTAddonPreferences(bpy.types.AddonPreferences):
         description="ComfyUI 根目录。留空时使用插件目录下的 comfyui_portable",
         subtype='DIR_PATH',
         default="",
-    )
-
-    # OpenAI-compatible image APIs (旧版兼容字段)
-    gpt_api_key: bpy.props.StringProperty(
-        name="API Key（旧版）",
-        description="旧版 OpenAI 兼容 API Key。建议使用上方 API Provider 管理",
-        subtype='PASSWORD',
-    )
-    gpt_model: bpy.props.StringProperty(
-        name="默认图像模型（旧版）",
-        description="旧版默认模型。建议使用上方 API Provider 管理",
-        default="gpt-image-2",
-    )
-    gpt_base_url: bpy.props.StringProperty(
-        name="Base URL（旧版）",
-        description="旧版 API 地址。建议使用上方 API Provider 管理",
-        default="https://api.openai.com/v1",
-    )
-    prompt_optimize_api_key: bpy.props.StringProperty(
-        name="提示词优化 API Key（旧版）",
-        description="旧版提示词优化密钥。建议使用上方 API Provider 管理",
-        subtype='PASSWORD',
-    )
-    prompt_optimize_base_url: bpy.props.StringProperty(
-        name="提示词优化 Base URL（旧版）",
-        description="旧版提示词优化地址。建议使用上方 API Provider 管理",
-        default="",
-    )
-    prompt_optimize_model: bpy.props.StringProperty(
-        name="提示词优化模型（旧版）",
-        description="旧版提示词优化文本模型。建议使用上方 API Provider 管理",
-        default="gpt-5.5",
-    )
-
-    # Gemini (旧版兼容槽位)
-    nanobanana_api_key: bpy.props.StringProperty(
-        name="Gemini API Key（旧版）",
-        description="旧版 Google AI Studio / Gemini API Key。建议使用上方 API Provider 管理",
-        subtype='PASSWORD',
-    )
-    nanobanana_url: bpy.props.StringProperty(
-        name="Gemini API 地址（旧版）",
-        description="旧版 Gemini API 端点。建议使用上方 API Provider 管理",
-        default="https://generativelanguage.googleapis.com/v1beta",
-    )
-    nanobanana_model: bpy.props.StringProperty(
-        name="默认 Gemini 模型（旧版）",
-        description="旧版默认 Gemini 图像生成模型。建议使用上方 API Provider 管理",
-        default="gemini-2.5-flash-image",
     )
 
     asset_output_path: bpy.props.StringProperty(
@@ -999,6 +1164,17 @@ class CTAddonPreferences(bpy.types.AddonPreferences):
 
         api_box = layout.box()
         api_box.label(text="API 提供商", icon='URL')
+        api_missing = dependency_missing_for_profile('API')
+        if api_missing:
+            warn_row = api_box.row()
+            warn_row.alert = True
+            warn_row.label(
+                text="未安装 keyring，API Key 将以明文存储在 Blender 用户配置中。",
+                icon='ERROR',
+            )
+            repair = api_box.row()
+            op = repair.operator("ai_concept.repair_dependencies", text="一键修复 API 组件", icon='IMPORT')
+            op.profile = 'API'
         for idx, provider in enumerate(self.api_providers):
             if not provider.provider_id:
                 provider.provider_id = _new_provider_id("api")
@@ -1050,6 +1226,7 @@ classes = [
     AIAPIModelItem,
     AIAPIProviderItem,
     CTAddonPreferences,
+    AI_OT_GetComfyUI,
     AI_OT_TestProviderConnection,
     AI_OT_AddAPIProvider,
     AI_OT_RemoveAPIProvider,

@@ -11,7 +11,6 @@ from ..utils.image_utils import (
     numpy_to_blender_image,
     resize_numpy_image,
     resize_numpy_image_keep_aspect,
-    save_numpy_image,
 )
 from ..sd_backend.connection_pool import ConnectionPool
 from ..sd_backend.abstract_client import GenerationConfig
@@ -20,11 +19,11 @@ from ..ui import preview_manager
 from ..material.uv_extractor import UVExtractor
 from ..material.shader_builder import ShaderBuilder
 from ..material.pbr_processor import generate_normal_map, generate_roughness_map, generate_metallic_map
+from ..material.seamless_processor import make_seamless_tile_local
 from ..material.local_pbr_processor import (
     compute_seam_metrics,
     generate_height_from_normal,
     generate_normal_from_diffuse,
-    make_seamless_tile_local,
     renormalize_normal_map,
 )
 from ..properties import _build_preservation_prompt
@@ -360,6 +359,11 @@ class GenerationOrchestrator:
         if self._cancel_event:
             self._cancel_event.set()
         client = self._active_client
+        if client and hasattr(client, "cancel"):
+            try:
+                client.cancel()
+            except Exception:
+                log.debug("Backend cancel failed")
         if client and hasattr(client, "interrupt"):
             try:
                 client.interrupt()
@@ -393,7 +397,7 @@ class GenerationOrchestrator:
                     "progress": 0.1,
                     "message": "正在本地处理参考图...",
                 })
-                self._process_reference(data, use_chord=False)
+                self._process_reference(data)
                 return
 
             if self._is_cancelled(data):
@@ -503,7 +507,7 @@ class GenerationOrchestrator:
         supported = {'diffuse', 'normal', 'roughness', 'metallic', 'height', 'ao'}
         processed = {}
         map_list = list(textures.items())
-        print(f"[AI Texture] _postprocess_comfyui_seams: start maps={[k for k, _ in map_list]} method={method}")
+        log.debug(f" _postprocess_comfyui_seams: start maps={[k for k, _ in map_list]} method={method}")
         for idx, (map_type, img) in enumerate(map_list):
             if map_type not in supported or img is None:
                 processed[map_type] = img
@@ -513,7 +517,7 @@ class GenerationOrchestrator:
                 "progress": 0.52 + 0.28 * (idx / max(len(map_list), 1)),
                 "message": f"正在对 {map_type} 贴图做无缝处理...",
             })
-            print(f"[AI Texture] _postprocess_comfyui_seams: processing {map_type} shape={getattr(img, 'shape', 'n/a')}")
+            log.debug(f" _postprocess_comfyui_seams: processing {map_type} shape={getattr(img, 'shape', 'n/a')}")
             # normal 需要避免空间偏移：PPS/PRESERVE 不偏移原图，可直接复用；
             # SMART/ADVANCED/BASIC 等会偏移/裁剪，用法线向量域 BASIC 混合。
             if map_type == "normal" and method not in {"PPS", "PRESERVE"}:
@@ -533,10 +537,10 @@ class GenerationOrchestrator:
             if map_type == 'normal':
                 out = renormalize_normal_map(out)
             processed[map_type] = out
-        print("[AI Texture] _postprocess_comfyui_seams: done")
+        log.debug(" _postprocess_comfyui_seams: done")
         return processed
 
-    def _process_reference(self, data, use_chord: bool = True):
+    def _process_reference(self, data):
         """有参考图且 prompt 为空时：直接处理参考图为无缝 diffuse，再提取 PBR。
 
         处理顺序参考 v1.0.0：先 fit 到目标尺寸，再做无缝化，避免在无缝化后再裁剪
@@ -602,7 +606,7 @@ class GenerationOrchestrator:
         effective_use_chord = self._should_use_chord(data, use_chord)
         family_id = data.get("local_comfyui_family", "zimage") or "zimage"
         seamless_method = _wf_specs.get_family_seamless_method(family_id)
-        print(f"[AI Texture] _extract_pbr: start using_local_pbr={using_local_pbr}, effective_use_chord={effective_use_chord}, target={target_w}x{target_h}, family={family_id}, seamless={seamless_method}")
+        log.debug(f" _extract_pbr: start using_local_pbr={using_local_pbr}, effective_use_chord={effective_use_chord}, target={target_w}x{target_h}, family={family_id}, seamless={seamless_method}")
 
         # CHORD 内部固定 1024 推理：高分辨率时没必要先放大到目标尺寸再喂给 CHORD
         if effective_use_chord and max(target_w, target_h) > 1024:
@@ -628,7 +632,7 @@ class GenerationOrchestrator:
         textures['diffuse'] = diffuse
 
         if effective_use_chord:
-            print(f"[AI Texture] Extract PBR: CHORD-only workflow ({chord_input_w}x{chord_input_h}) -> output {target_w}x{target_h}")
+            log.debug(f" Extract PBR: CHORD-only workflow ({chord_input_w}x{chord_input_h}) -> output {target_w}x{target_h}")
             chord_success = False
             try:
                 comfyui_path = data.get("comfyui_path", "") or comfyui_installer.get_default_install_path()
@@ -697,7 +701,7 @@ class GenerationOrchestrator:
                     diffuse = resize_numpy_image(diffuse, target_w, target_h)
                     textures['diffuse'] = diffuse
         else:
-            print(f"[AI Texture] Extract PBR: local algorithm ({target_w}x{target_h})")
+            log.debug(f" Extract PBR: local algorithm ({target_w}x{target_h})")
             thread_safe_callback({
                 "status": "progress",
                 "progress": 0.4,
@@ -753,7 +757,6 @@ class GenerationOrchestrator:
             textures['metallic'] = generate_metallic_map(
                 diffuse,
                 category=data.get("texture_category", ""),
-                finish=data.get("texture_finish", ""),
                 threshold=220,
             )
 
@@ -781,7 +784,7 @@ class GenerationOrchestrator:
         elif not already_seamless:
             # LOCAL_COMFYUI / API 非本地 PBR 模式：CHORD 完成后统一在 Blender 里做无缝
             if self._is_already_seamless(textures.get('diffuse')):
-                print("[AI Texture] _extract_pbr: diffuse already seamless, skip postprocess")
+                log.debug(" _extract_pbr: diffuse already seamless, skip postprocess")
             else:
                 textures = self._postprocess_comfyui_seams(textures, method=seamless_method)
 
@@ -791,9 +794,9 @@ class GenerationOrchestrator:
             "progress": 0.9,
             "message": "正在应用 PBR 材质...",
         })
-        print("[AI Texture] _extract_pbr: calling run_on_main_thread(_import_texture_results)")
+        log.debug(" _extract_pbr: calling run_on_main_thread(_import_texture_results)")
         run_on_main_thread(lambda: self._import_texture_results(data, textures_for_import), timeout=60.0)
-        print("[AI Texture] _extract_pbr: run_on_main_thread returned")
+        log.debug(" _extract_pbr: run_on_main_thread returned")
 
     def _process_comfy_pbr_result(self, data, result):
         """解析 ComfyUI 返回的 PBR 贴图，补齐缺失通道，并按统一方式做无缝修复。"""
@@ -862,7 +865,7 @@ class GenerationOrchestrator:
 
             # 有参考图 + prompt 为空：直接本地处理参考图
             if data.get("reference_numpy") is not None and not data.get("has_user_prompt", False):
-                self._process_reference(data, use_chord=use_chord)
+                self._process_reference(data)
                 return
 
             # 有参考图 + 有 prompt：直接传 numpy 数组给后端，由后端决定编码方式
@@ -904,9 +907,9 @@ class GenerationOrchestrator:
 
             max_target = max(int(base_config.width), int(base_config.height))
             if max_target > 1024:
-                print(f"[AI Texture] Local ComfyUI >1024: CHORD-first + SeedVR2 ({base_config.width}x{base_config.height})")
+                log.debug(f" Local ComfyUI >1024: CHORD-first + SeedVR2 ({base_config.width}x{base_config.height})")
             else:
-                print(f"[AI Texture] Local ComfyUI <=1024: Z-Image + CHORD ({base_config.width}x{base_config.height})")
+                log.debug(f" Local ComfyUI <=1024: Z-Image + CHORD ({base_config.width}x{base_config.height})")
 
             result = client.execute_workflow_json(base_config)
             client.set_progress_callback(None)
@@ -933,7 +936,7 @@ class GenerationOrchestrator:
 
             # 有参考图 + prompt 为空：直接本地处理参考图
             if data.get("reference_numpy") is not None and not data.get("has_user_prompt", False):
-                self._process_reference(data, use_chord=self._is_comfyui_installed_for_data(data))
+                self._process_reference(data)
                 return
 
             # 有参考图 + 有 prompt：直接传 numpy 数组给 API 客户端
@@ -969,7 +972,7 @@ class GenerationOrchestrator:
                 if not isinstance(diffuse, np.ndarray):
                     diffuse = np.array(diffuse)
 
-                print(f"[AI Texture] API image {idx + 1}/{len(result.images)}: CHORD + unified seamless")
+                log.debug(f" API image {idx + 1}/{len(result.images)}: CHORD + unified seamless")
                 self._extract_pbr(diffuse, item_data, use_chord=self._is_comfyui_installed_for_data(item_data))
 
         except Exception as e:
@@ -980,7 +983,7 @@ class GenerationOrchestrator:
 
     def _import_texture_results(self, data, textures=None):
         """在主线程中创建 Blender Image 和 PBR 材质。"""
-        print("[AI Texture] _import_texture_results: start")
+        log.debug(" _import_texture_results: start")
         try:
             if self._is_cancelled(data):
                 thread_safe_callback({"status": "cancelled"})
@@ -1059,7 +1062,7 @@ class GenerationOrchestrator:
                 })
                 return
 
-            print(f"[AI Texture] _import_texture_results: output_dir={output_dir}, maps={list(textures.keys())}, size={target_w}x{target_h}")
+            log.debug(f" _import_texture_results: output_dir={output_dir}, maps={list(textures.keys())}, size={target_w}x{target_h}")
             images = {}
             batch_id = time.strftime("%Y%m%d_%H%M%S")
             if data.get("batch_total", 1) > 1:
@@ -1069,7 +1072,7 @@ class GenerationOrchestrator:
             for map_type, np_img in textures.items():
                 suffix = _MAP_TYPE_SUFFIX.get(map_type, map_type.upper()[:3])
                 img_name = f"{material_name}_{suffix}_{batch_id}"
-                print(f"[AI Texture] _import_texture_results: creating Blender image {img_name} shape={np_img.shape}")
+                log.debug(f" _import_texture_results: creating Blender image {img_name} shape={np_img.shape}")
 
                 # 统一转换为 RGBA uint8
                 if np_img.ndim == 2:
@@ -1096,7 +1099,7 @@ class GenerationOrchestrator:
 
                 images[map_type] = blender_img
 
-            print(f"[AI Texture] _import_texture_results: building material with {len(images)} images")
+            log.debug(f" _import_texture_results: building material with {len(images)} images")
             mat = ShaderBuilder.build_principled_bsdf(
                 f"Mat_{material_name}_PBR",
                 images,
@@ -1124,7 +1127,7 @@ class GenerationOrchestrator:
 
             props.active_result_index = len(props.results) - 1
 
-            print(f"[AI Texture] _import_texture_results: applied material to {obj.name}")
+            log.debug(f" _import_texture_results: applied material to {obj.name}")
             thread_safe_callback({
                 "status": "progress",
                 "progress": 1.0,
@@ -1141,11 +1144,6 @@ class GenerationOrchestrator:
                 "message": str(e),
             })
         return None
-
-    def _run_texture_generation(self, context, client):
-        # Kept for compatibility; texture generation logic is now in worker
-        pass
-
 
 def register():
     pass

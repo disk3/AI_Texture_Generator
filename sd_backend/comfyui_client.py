@@ -40,6 +40,10 @@ def _requests_module():
 
 class ComfyUIClient(AbstractSDClient):
 
+    # ComfyUI 核心内置节点版本要求：{class_type: (minimum_version, feature_name)}
+    # 当前工作流使用的多为早期核心节点，留空以避免误报；custom nodes 提示见 _validate_workflow_nodes。
+    _BUILT_IN_NODE_VERSION_REQUIREMENTS: Dict[str, Tuple[str, str]] = {}
+
     def __init__(self, base_url: str = "http://127.0.0.1:8188", timeout: int = 600,
                  zimage_workflow_path: str = ""):
         self.base_url = base_url.rstrip("/")
@@ -47,6 +51,7 @@ class ComfyUIClient(AbstractSDClient):
         self.timeout = timeout
         self._progress_cb = None
         self._zimage_workflow_path = zimage_workflow_path
+        self._cancelled = False
 
     def check_health(self, auto_launch_path: str = "") -> bool:
         """检查 ComfyUI 是否在线，若不在线且提供了安装路径则自动启动。
@@ -146,6 +151,10 @@ class ComfyUIClient(AbstractSDClient):
     def set_progress_callback(self, callback):
         self._progress_cb = callback
 
+    def cancel(self):
+        """标记当前工作流应被取消；实际中断由 _execute_workflow 响应。"""
+        self._cancelled = True
+
     def interrupt(self) -> bool:
         """Best-effort cancellation for the currently running ComfyUI prompt."""
         requests = _requests_module()
@@ -214,7 +223,7 @@ class ComfyUIClient(AbstractSDClient):
 
         resolver = lambda logical_name: specs.resolve_node_id(family, logical_name, post_id_map)
 
-        print(
+        log.debug(
             f"[AI Texture] Local ComfyUI: family={family_id}, "
             f"templates={family['gen_template']}+{post_template_name} ({target_w}x{target_h})"
         )
@@ -235,7 +244,7 @@ class ComfyUIClient(AbstractSDClient):
             self._set_seedvr2_resolution_by_spec(workflow, family, resolver, target_w, target_h)
 
         if config.init_image is not None:
-            self._apply_reference_image(workflow, family, resolver, config)
+            self._apply_reference_image(workflow, resolver, config)
 
         # 保留对旧 model_overrides 的兼容（仅当节点 ID 存在时生效）
         for node_id, params in getattr(config, "model_overrides", {}).items():
@@ -244,7 +253,7 @@ class ComfyUIClient(AbstractSDClient):
                 log.debug("Applied legacy model override node %s: %s", node_id, params)
 
         # 预校验模型文件是否存在于 ComfyUI 对应目录，避免提交后才报 400
-        self._validate_model_files(workflow, family, getattr(config, "model_selections", {}))
+        self._validate_model_files(family, getattr(config, "model_selections", {}))
 
         return workflow, actual_seed, chord_first
 
@@ -341,7 +350,6 @@ class ComfyUIClient(AbstractSDClient):
     def _apply_reference_image(
         self,
         workflow: Dict[str, Any],
-        family: Dict[str, Any],
         resolver,
         config: GenerationConfig,
     ) -> None:
@@ -397,10 +405,15 @@ class ComfyUIClient(AbstractSDClient):
         target_h: int,
     ) -> Dict[str, Any]:
         """加载旧版完整 workflow JSON（仅用于外部自定义路径兼容）。"""
-        with open(path, "r", encoding="utf-8") as f:
-            workflow = json.load(f)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                workflow = json.load(f)
+        except FileNotFoundError as e:
+            raise RuntimeError(f"Workflow file not found: {path}") from e
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"Invalid workflow JSON '{path}': {e}") from e
 
-        print(f"[AI Texture] Local ComfyUI (legacy): running workflow '{os.path.basename(path)}' ({target_w}x{target_h})")
+        log.debug(f"[AI Texture] Local ComfyUI (legacy): running workflow '{os.path.basename(path)}' ({target_w}x{target_h})")
 
         overrides = self._build_zimage_overrides(config)
         for node_id, params in overrides.items():
@@ -485,10 +498,15 @@ class ComfyUIClient(AbstractSDClient):
         addon_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         path = os.path.join(addon_dir, "workflows", "chord_only_api.json")
 
-        with open(path, "r", encoding="utf-8") as f:
-            workflow = json.load(f)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                workflow = json.load(f)
+        except FileNotFoundError as e:
+            raise RuntimeError(f"Workflow file not found: {path}") from e
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"Invalid workflow JSON '{path}': {e}") from e
 
-        print(f"[AI Texture] CHORD-only: running workflow '{os.path.basename(path)}' ({width}x{height})")
+        log.debug(f"[AI Texture] CHORD-only: running workflow '{os.path.basename(path)}' ({width}x{height})")
 
         # 3. 替换 LoadImage 节点为上传的图片
         workflow["100"]["inputs"]["image"] = uploaded_name
@@ -700,7 +718,6 @@ class ComfyUIClient(AbstractSDClient):
 
     def _validate_model_files(
         self,
-        workflow: dict,
         family: Dict[str, Any],
         selections: Dict[str, str],
     ) -> None:
@@ -757,7 +774,9 @@ class ComfyUIClient(AbstractSDClient):
 
             try:
                 import websocket
-                ws = websocket.create_connection(f"{self.ws_url}?clientId={client_id}", timeout=workflow_timeout)
+                # 连接阶段使用短超时；建立后设置 1s recv 超时以便响应取消
+                ws = websocket.create_connection(f"{self.ws_url}?clientId={client_id}", timeout=10)
+                ws.settimeout(1.0)
             except ImportError:
                 log.debug("websocket-client not installed; falling back to HTTP polling")
                 thread_safe_callback({
@@ -769,29 +788,11 @@ class ComfyUIClient(AbstractSDClient):
 
             prompt_data = {"prompt": workflow, "client_id": client_id}
 
-            # 调试用：始终保存最近一次提交的实际 workflow JSON，便于与 ComfyUI 直接运行对比
-            last_workflow_path = os.path.join(tempfile.gettempdir(), "ai_texture_last_workflow.json")
-            try:
-                with open(last_workflow_path, "w", encoding="utf-8") as f:
-                    json.dump(workflow, f, ensure_ascii=False, indent=2)
-            except Exception:
-                pass
-
             resp = requests.post(f"{self.base_url}/prompt", json=prompt_data, timeout=30)
             if resp.status_code >= 400:
-                # 记录完整错误响应与当前 workflow，方便定位 400 Bad Request 根因
                 detail = resp.text[:2048]
                 log.error("ComfyUI /prompt %s: %s", resp.status_code, detail)
-                dump_path = os.path.join(tempfile.gettempdir(), f"ai_texture_workflow_{client_id}.json")
-                try:
-                    with open(dump_path, "w", encoding="utf-8") as f:
-                        json.dump(workflow, f, ensure_ascii=False, indent=2)
-                except Exception:
-                    dump_path = "<failed to dump>"
-                raise RuntimeError(
-                    f"ComfyUI 提交失败 ({resp.status_code}): {detail}\n"
-                    f"workflow 已转储: {dump_path}"
-                )
+                raise RuntimeError(f"ComfyUI 提交失败 ({resp.status_code}): {detail}")
             prompt_id = resp.json()["prompt_id"]
             log.debug("ComfyUI prompt_id: %s", prompt_id)
 
@@ -801,13 +802,24 @@ class ComfyUIClient(AbstractSDClient):
             history = None
             if ws is not None:
                 while True:
-                    msg = ws.recv()
+                    if self._cancelled:
+                        raise TimeoutError("Generation cancelled")
+                    try:
+                        msg = ws.recv()
+                    except websocket.WebSocketTimeoutException:
+                        continue
+                    except Exception as e:
+                        log.debug("WebSocket recv failed: %s", e)
+                        break
                     if isinstance(msg, str):
-                        msg_data = json.loads(msg)
+                        try:
+                            msg_data = json.loads(msg)
+                        except json.JSONDecodeError:
+                            continue
                         msg_type = msg_data.get("type")
                         if msg_type == "progress":
                             value = msg_data.get("data", {}).get("value", 0)
-                            max_val = msg_data.get("data", {}).get("max", 1)
+                            max_val = max(msg_data.get("data", {}).get("max", 1), 1)
                             progress = 0.2 + (value / max_val) * 0.6
                             if self._progress_cb:
                                 self._progress_cb(progress, f"Sampling step {value}/{max_val}")
@@ -820,6 +832,8 @@ class ComfyUIClient(AbstractSDClient):
                 deadline = time.time() + workflow_timeout
                 last_report = 0.0
                 while time.time() < deadline:
+                    if self._cancelled:
+                        raise TimeoutError("Generation cancelled")
                     history_resp = requests.get(f"{self.base_url}/history/{prompt_id}", timeout=30)
                     if history_resp.status_code == 200:
                         candidate = history_resp.json()
@@ -833,7 +847,7 @@ class ComfyUIClient(AbstractSDClient):
                         progress = 0.2 + min(elapsed / max(workflow_timeout, 1), 1.0) * 0.65
                         self._progress_cb(progress, "ComfyUI 正在执行工作流...")
                         last_report = now
-                    time.sleep(1)
+                    time.sleep(0.5)
                 if history is None:
                     raise TimeoutError(f"ComfyUI 工作流轮询超时（{workflow_timeout} 秒）")
 
@@ -849,22 +863,14 @@ class ComfyUIClient(AbstractSDClient):
 
             images = []
             pbr_maps = {}
-            output_debug = []
             for node_id, node_output in outputs.items():
-                # Determine prefix from the workflow definition
                 prefix = ""
                 if node_id in workflow:
                     node_def = workflow[node_id]
                     if node_def.get("class_type") == "SaveImage":
                         prefix = node_def.get("inputs", {}).get("filename_prefix", "")
-
                 for img_info in node_output.get("images", []):
                     filename = img_info.get('filename', '')
-                    output_debug.append({
-                        "node": node_id,
-                        "prefix": prefix,
-                        "filename": filename,
-                    })
                     from urllib.parse import urlencode
                     view_query = urlencode({
                         "filename": filename,
@@ -914,7 +920,6 @@ class ComfyUIClient(AbstractSDClient):
                     "backend": "comfyui",
                     "timestamp": time.time(),
                     "prompt_id": prompt_id,
-                    "outputs": output_debug,
                 },
                 pbr_maps=pbr_maps,
             )

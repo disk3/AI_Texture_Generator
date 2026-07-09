@@ -168,28 +168,3 @@ class ShaderBuilder:
 
         return mat
 
-    @staticmethod
-    def build_emission_plane(name: str, image: bpy.types.Image) -> bpy.types.Material:
-        mat = bpy.data.materials.new(name=name)
-        mat.use_nodes = True
-        nodes = mat.node_tree.nodes
-        links = mat.node_tree.links
-
-        for node in nodes:
-            nodes.remove(node)
-
-        output = nodes.new(type='ShaderNodeOutputMaterial')
-        output.location = (400, 0)
-
-        emission = nodes.new(type='ShaderNodeEmission')
-        emission.location = (200, 0)
-        emission.inputs['Strength'].default_value = 1.0
-
-        tex_image = nodes.new(type='ShaderNodeTexImage')
-        tex_image.location = (0, 0)
-        tex_image.image = image
-
-        links.new(tex_image.outputs['Color'], emission.inputs['Color'])
-        links.new(emission.outputs['Emission'], output.inputs['Surface'])
-
-        return mat

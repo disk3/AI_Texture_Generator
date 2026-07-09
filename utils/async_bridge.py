@@ -25,7 +25,7 @@ def get_orchestrator():
 def thread_safe_callback(result: dict):
     _result_queue.put(result)
     if result.get("status") == "error":
-        print(f"[AI Texture ERROR] {result.get('message', '')}")
+        log.error("%s", result.get("message", ""))
 
 
 def run_on_main_thread(func, timeout: float = 60.0):
@@ -41,7 +41,7 @@ def run_on_main_thread(func, timeout: float = 60.0):
     box = {}
     _main_thread_call_queue.put((func, done, box))
     if not done.wait(timeout):
-        print(f"[AI Texture ERROR] run_on_main_thread: timeout after {timeout}s")
+        log.error("run_on_main_thread: timeout after %ss", timeout)
         raise TimeoutError("Timed out waiting for Blender main thread")
     if "error" in box:
         raise box["error"]
@@ -71,7 +71,6 @@ def blender_timer_poll() -> float:
         except Exception as e:
             # 单个结果回调抛异常不应搞崩整个 timer，否则后续主线程调用会永远挂起
             log.exception("Failed to apply callback result: %s", result)
-            print(f"[AI Texture ERROR] 状态回调失败: {e}")
     return 0.1
 
 
@@ -101,7 +100,7 @@ def _apply_result_in_main_thread(result: dict):
     elif status == "warning":
         msg = result.get("message", "")
         props.status_message = f"提示: {msg}"
-        print(f"[AI Texture WARNING] {msg}")
+        log.warning("%s", msg)
     elif status == "cancelled":
         props.is_generating = False
         props.progress = 0.0

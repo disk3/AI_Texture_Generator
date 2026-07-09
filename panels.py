@@ -44,7 +44,7 @@ def _provider_status(prefs, provider):
         api_provider = preferences.find_api_provider(prefs, preferences.provider_id_from_value(provider))
         if not api_provider:
             return "未找到 API Provider", 'ERROR'
-        if not api_provider.api_key:
+        if not preferences.get_api_key(api_provider.provider_id):
             return f"请在偏好设置中填写 {api_provider.name} API Key", 'ERROR'
         if not api_provider.base_url:
             return f"请在偏好设置中填写 {api_provider.name} Base URL", 'ERROR'
@@ -193,7 +193,7 @@ class AI_PT_TexturePanel(bpy.types.Panel):
         show_local_normal = props.use_local_pbr
         try:
             show_local_normal = show_local_normal or not _is_local_comfyui_ready(prefs)
-        except Exception:
+        except AttributeError:
             show_local_normal = True
         if show_local_normal:
             try:
@@ -203,6 +203,7 @@ class AI_PT_TexturePanel(bpy.types.Panel):
                 _prop_row(box, props, "normal_detail", "细节")
                 box.prop(props, "normal_invert", text="反转绿色通道")
             except Exception as e:
+                log.warning("Failed to draw local normal settings: %s", e)
                 box = layout.box()
                 box.label(text=f"法线参数显示错误: {e}", icon='ERROR')
 

@@ -73,8 +73,13 @@ def get_workflows_dir() -> str:
 def load_workflow_template(name: str) -> Dict[str, Any]:
     """加载 workflows/ 目录下的 JSON 模板。"""
     path = os.path.join(get_workflows_dir(), name)
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError as e:
+        raise RuntimeError(f"Workflow template not found: {name}") from e
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Invalid workflow JSON '{name}': {e}") from e
 
 
 def _unique_post_id(original_id: str, used_ids: set) -> str:

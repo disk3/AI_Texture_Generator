@@ -54,6 +54,8 @@ def save_numpy_image(arr: np.ndarray, path: str, file_format: str = "PNG") -> No
 
 def resize_numpy_image(arr: np.ndarray, new_w: int, new_h: int) -> np.ndarray:
     """numpy 图像双线性缩放（支持 2D 灰度或 HWC 彩色，uint8/float32）。"""
+    if new_w <= 0 or new_h <= 0:
+        raise ValueError(f"Invalid target size: {new_w}x{new_h}")
     if arr.ndim == 2:
         arr = arr[..., np.newaxis]
 
@@ -150,42 +152,6 @@ def resize_numpy_image_keep_aspect(
     if flat:
         return out[..., 0]
     return out
-
-
-def pil_to_blender_pixels(pil_img) -> list:
-    """PIL Image → Blender pixels 扁平列表（需要 Pillow）。"""
-    try:
-        from PIL import Image
-    except ImportError as e:
-        raise ImportError("pil_to_blender_pixels 需要 Pillow，请安装 Pillow") from e
-
-    if not isinstance(pil_img, Image.Image):
-        raise TypeError("pil_img must be a PIL Image")
-    if pil_img.mode != 'RGBA':
-        pil_img = pil_img.convert('RGBA')
-    pixels = list(pil_img.getdata())
-    return [c / 255.0 for px in pixels for c in px]
-
-
-def blender_pixels_to_pil(blender_img) -> "Image.Image":
-    """Blender Image → PIL Image（需要 Pillow）。"""
-    try:
-        from PIL import Image
-    except ImportError as e:
-        raise ImportError("blender_pixels_to_pil 需要 Pillow，请安装 Pillow") from e
-
-    width = blender_img.size[0]
-    height = blender_img.size[1]
-    pixels = np.array(blender_img.pixels[:]).reshape((height, width, 4))
-    pixels = (pixels * 255).astype(np.uint8)
-    return Image.fromarray(pixels, 'RGBA')
-
-
-def normalize_depth(z_pass: np.ndarray, near: float, far: float) -> np.ndarray:
-    valid = np.clip(z_pass, near, far)
-    normalized = (valid - near) / (far - near)
-    normalized = 1.0 - normalized
-    return (normalized * 65535).astype(np.uint16)
 
 
 def _guess_image_extension(data: bytes) -> str:

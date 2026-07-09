@@ -194,7 +194,6 @@ def generate_roughness_map(
 def generate_metallic_map(
     diffuse: np.ndarray,
     category: str = "",
-    finish: str = "",
     threshold: int = 220,
 ) -> np.ndarray:
     """从 diffuse（numpy uint8 RGB/RGBA）生成 metallic 贴图（numpy uint8 RGB），根据材质物理属性决定金属度。

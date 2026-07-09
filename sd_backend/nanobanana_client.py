@@ -151,13 +151,14 @@ class NanobananaClient(AbstractSDClient):
 
         # 429 自动重试（指数退避）
         max_retries = 3
+        resp = None
         for attempt in range(max_retries):
             try:
                 resp = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
                 resp.raise_for_status()
                 break
             except requests.exceptions.HTTPError:
-                if resp.status_code == 429 and attempt < max_retries - 1:
+                if resp is not None and resp.status_code == 429 and attempt < max_retries - 1:
                     wait = 3 * (attempt + 1)
                     if self._progress_cb:
                         self._progress_cb(0.35, f"速率限制 (429)，{wait} 秒后重试...")

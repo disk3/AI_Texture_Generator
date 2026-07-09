@@ -226,6 +226,7 @@ def _kill_by_port(port: int):
             capture_output=True,
             text=True,
             creationflags=subprocess.CREATE_NO_WINDOW,
+            timeout=10,
         )
         pids = set()
         for line in result.stdout.splitlines():
@@ -244,6 +245,7 @@ def _kill_by_port(port: int):
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 creationflags=subprocess.CREATE_NO_WINDOW,
+                timeout=10,
             )
     except Exception as e:
         log.warning("Failed to kill process by port %d: %s", port, e)
@@ -255,7 +257,7 @@ def _extract_port(base_url: str) -> int:
         match = re.search(r":(\d+)(?:/|$)", base_url or "")
         if match:
             return int(match.group(1))
-    except (ValueError, Exception):
+    except (ValueError, OSError):
         log.debug("Failed to extract port from URL: %s", base_url)
     return 8188
 
@@ -281,6 +283,7 @@ def shutdown_comfyui(base_url: str = "", force_by_port: bool = False):
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     creationflags=subprocess.CREATE_NO_WINDOW,
+                    timeout=10,
                 )
             else:
                 try:

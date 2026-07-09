@@ -523,19 +523,3 @@ def make_seamless_tile_local(
     return _from_float_rgba(rgba, info)
 
 
-def process_single_image(
-    image: np.ndarray,
-    channel: str = "diffuse",
-    manual_class=None,
-) -> tuple[np.ndarray, None]:
-    """兼容旧调用点的单图入口，固定返回 (image, None)。"""
-    out = make_seamless_tile_local(
-        image,
-        method="SMART" if channel != "normal" else "BASIC",
-        is_normal=(channel == "normal"),
-    )
-    return out, None
-
-
-# 兼容旧导入名
-TextureClass = None

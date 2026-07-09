@@ -1,7 +1,7 @@
 bl_info = {
     "name": "AI 材质生成",
     "author": "Xiong Meng Han",
-    "version": (1, 1, 8),
+    "version": (1, 1, 9),
     "blender": (3, 6, 0),
     "location": "3D 视图 > 侧边栏 (N) > AI 材质",
     "description": "从提示词或参考图一键生成 PBR 材质贴图（支持本地 ComfyUI 与在线 API）",
@@ -38,8 +38,8 @@ def _inject_vendor_site() -> str:
         try:
             import site
             site.addsitedir(vendor_dir)
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("Failed to inject vendor site: %s", e)
         if vendor_dir not in sys.path:
             sys.path.insert(0, vendor_dir)
     return vendor_dir
@@ -67,6 +67,7 @@ _OPTIONAL_PACKAGES = {
     "cv2":             "OpenCV（法线贴图 Sobel 算法，无此包将回退到简化实现）",
     "py7zr":           "7z 解压库（ComfyUI 安装，无此包将尝试系统 7z 命令）",
     "websocket":       "WebSocket 客户端（ComfyUI 实时进度，无此包将回退到 HTTP polling）",
+    "keyring":         "系统密钥环（安全存储 API Key，无此包将回退到明文存储）",
 }
 
 
@@ -79,61 +80,6 @@ def _check_runtime_dependencies() -> list:
         except ImportError:
             missing.append(f"{pkg} ({desc})")
     return missing
-
-
-def _check_backend_dependencies() -> list:
-    """检查 ComfyUI / API 后端所需的依赖，返回缺失包名列表。"""
-    missing = []
-    for pkg, desc in _BACKEND_PACKAGES.items():
-        # PIL 的导入名是 PIL，但 pip 包名是 Pillow
-        import_name = "PIL" if pkg == "PIL" else pkg
-        try:
-            __import__(import_name)
-        except ImportError:
-            missing.append(f"{pkg} ({desc})")
-    return missing
-
-
-def ensure_backend_dependencies(comfyui_path: str = "") -> tuple[bool, str]:
-    """安装本地 ComfyUI 环境增强依赖。
-
-    逻辑：
-      1. 若 Blender 当前 Python 已有 PIL/requests，直接返回成功。
-      2. 若提供了 ComfyUI 路径（尤其是 Windows 便携版），尝试注入其
-         python_embeded/Lib/site-packages 中的依赖。
-      3. 仍缺失时尝试自动 pip install 安装。
-      4. 全部失败则返回错误提示，由调用方弹窗/报告。
-
-    返回 (success, message)。
-    """
-    missing = _check_backend_dependencies()
-    if not missing:
-        return True, "增强依赖已就绪"
-
-    # 1) 尝试复用 ComfyUI 便携版依赖
-    if comfyui_path:
-        try:
-            from .sd_backend.comfyui_env_resolver import inject_comfyui_packages
-            if inject_comfyui_packages(comfyui_path):
-                missing = _check_backend_dependencies()
-                if not missing:
-                    return True, "已从 ComfyUI 复用增强依赖"
-        except Exception as e:
-            log.debug("Failed to inject ComfyUI packages: %s", e)
-
-    # 2) 尝试自动安装
-    log.info("ComfyUI environment dependencies missing, trying auto-install: %s", ", ".join(missing))
-    ok, msg = _auto_install_dependencies(missing, verifier=_check_backend_dependencies)
-    if ok:
-        return True, msg
-
-    # 3) 失败时返回手动命令
-    return False, (
-        "缺少本地 ComfyUI 环境依赖，自动安装失败。\n"
-        f"{msg}\n"
-        f"请手动运行: {sys.executable} -m pip install --target \"{_vendor_site_dir()}\" Pillow requests\n\n"
-        "或配置 Windows ComfyUI 便携版路径，让插件自动复用其纯 Python 依赖。"
-    )
 
 
 def _format_missing_packages(missing: list) -> str:
@@ -154,28 +100,6 @@ def _format_missing_packages(missing: list) -> str:
         "注意：安装命令必须对应当前 Blender 内置的 Python（上方路径），不能安装到系统 Python。\n"
         "安装后请完全关闭并重启 Blender，再重新启用插件。"
     )
-
-
-def _show_dependency_warning(missing: list, title: str = "AI 材质生成插件检测到缺失的 Python 包"):
-    """通过 Blender 弹窗提示用户安装缺失的依赖。"""
-    import textwrap
-    lines = [
-        title,
-        "",
-    ]
-    for m in missing:
-        lines.append(f"  • {m}")
-    lines.extend([
-        "",
-        _format_missing_packages(missing),
-    ])
-
-    def _draw_warning(self_dummy, context):
-        layout = self_dummy.layout
-        for line in textwrap.wrap("\n".join(lines), width=90):
-            layout.label(text=line)
-
-    bpy.context.window_manager.popup_menu(_draw_warning, title="依赖缺失", icon='ERROR')
 
 
 def _resolve_comfyui_url() -> str:
@@ -205,7 +129,7 @@ def _shutdown_on_exit():
     # 防止 unregister() 再次触发 atexit
     try:
         atexit.unregister(_shutdown_on_exit)
-    except (ValueError, Exception):
+    except ValueError:
         pass
 
 
@@ -288,6 +212,9 @@ def _auto_install_dependencies(missing: list, verifier=None) -> tuple[bool, str]
                 timeout=180,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
+            log.debug("pip install command: %s", " ".join(cmd))
+            log.debug("pip install stdout:\n%s", proc.stdout)
+            log.debug("pip install stderr:\n%s", proc.stderr)
             if proc.returncode == 0:
                 return True, proc.stdout
             return False, proc.stderr or proc.stdout
@@ -295,10 +222,11 @@ def _auto_install_dependencies(missing: list, verifier=None) -> tuple[bool, str]
             return False, str(e)
 
     # 2) 依次尝试安装策略
+    # 清华镜像近期对 Pillow 等 wheel 经常返回 403，放到最后作为 fallback
     strategies = [
-        (["-i", "https://pypi.tuna.tsinghua.edu.cn/simple"], "插件目录 + 清华镜像"),
-        (["-i", "https://mirrors.aliyun.com/pypi/simple/"], "插件目录 + 阿里镜像"),
         ([], "插件目录 + PyPI 官方"),
+        (["-i", "https://mirrors.aliyun.com/pypi/simple/"], "插件目录 + 阿里镜像"),
+        (["-i", "https://pypi.tuna.tsinghua.edu.cn/simple"], "插件目录 + 清华镜像"),
     ]
 
     last_error = ""
@@ -347,6 +275,7 @@ def register():
     _inject_vendor_site()
 
     from . import preferences, panels, properties
+    from . import operators
     from .utils import async_bridge
     from .ui import preview_manager, icons as icon_manager
 
@@ -354,57 +283,41 @@ def register():
     modules.extend([
         preferences,
         properties,
+        operators,
         panels,
         async_bridge,
         preview_manager,
         icon_manager,
     ])
 
-    # 先注册基础 UI 模块，确保偏好设置、一键修复按钮等已经可用
+    # 先注册基础 UI 模块和 Operator，确保偏好设置、N-Panel 引用的 operator 都已存在
     for mod in modules:
         if hasattr(mod, "register"):
             mod.register()
 
-    # ── 自动安装一键修复环境依赖（全部推荐组件）──
-    # 在基础模块注册完成后再执行，避免阻塞注册流程并确保弹窗/UI 可用。
+    # 检查必需依赖是否就绪，缺失时不自动安装/不弹窗，仅记录日志。
+    # 一键修复按钮在 N-Panel 中始终可用，由用户手动触发安装。
     runtime_ready = True
     try:
         from .preferences import dependency_missing_for_profile
         missing = dependency_missing_for_profile('ALL')
         if missing:
-            missing_display = [f"{import_name} ({desc})" for import_name, _pip_name, desc in missing]
-
-            def _verifier_all():
-                return [f"{i} ({d})" for i, _p, d in dependency_missing_for_profile('ALL')]
-
-            log.warning(
-                "Missing dependencies on startup, attempting auto-install: %s",
-                ", ".join(missing_display),
-            )
-            ok, msg = _auto_install_dependencies(missing_display, verifier=_verifier_all)
-            if ok:
-                log.info("Auto-installed dependencies: %s", msg)
-            else:
-                runtime_ready = False
-                log.warning("Auto-install dependencies failed: %s", msg)
-                _show_dependency_warning(
-                    missing_display,
-                    "AI 材质生成插件自动安装依赖失败，请手动安装或点击“一键修复环境依赖”",
-                )
+            missing_display = ", ".join(f"{i} ({d})" for i, _p, d in missing)
+            log.warning("Missing dependencies on startup: %s", missing_display)
+            runtime_ready = False
     except Exception as e:
-        log.warning("Could not check/auto-install dependencies: %s", e)
+        log.warning("Could not check dependencies: %s", e)
+        runtime_ready = False
 
-    # 依赖就绪后再注册生成相关模块
+    # 依赖就绪后再注册生成编排器和 ComfyUI 客户端
     if runtime_ready:
         try:
-            from . import operators
             from .core import orchestrator
-            operators.register()
             orchestrator.register()
-            modules.extend([operators, orchestrator])
+            modules.append(orchestrator)
         except Exception as e:
             runtime_ready = False
-            log.warning("Generation operators were not registered: %s", e)
+            log.warning("Generation orchestrator was not registered: %s", e)
 
     # 后端模块（ComfyUI 客户端）可选加载
     if runtime_ready:

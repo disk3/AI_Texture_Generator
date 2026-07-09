@@ -58,10 +58,10 @@ class Response:
 
 
 def _timeout_value(timeout):
-    if isinstance(timeout, (tuple, list)) and timeout:
-        return float(timeout[-1])
     if timeout is None:
         return None
+    if isinstance(timeout, (tuple, list)):
+        return tuple(float(v) if v is not None else None for v in timeout)
     return float(timeout)
 
 

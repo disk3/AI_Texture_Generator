@@ -4,7 +4,7 @@ from .preferences import (
     get_api_text_model_items,
     get_texture_provider_items,
 )
-from .sd_backend.workflow_specs import get_family_spec, WORKFLOW_FAMILIES
+from .sd_backend.workflow_specs import get_family_spec
 from .utils.logger import get_logger
 
 log = get_logger(__name__)

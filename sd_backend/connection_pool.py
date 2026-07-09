@@ -1,3 +1,5 @@
+import hashlib
+
 from ..utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -32,7 +34,7 @@ class ConnectionPool:
                 key += f"#{model}"
             api_key = kwargs.get("api_key", "")
             if api_key:
-                key += f"@key:{abs(hash(api_key))}"
+                key += f"@key:{hashlib.sha256(api_key.encode('utf-8')).hexdigest()[:16]}"
 
         if key not in self._clients:
             if backend_type == 'COMFYUI':
