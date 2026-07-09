@@ -27,17 +27,19 @@
 
 1. 安装插件：Blender → Edit → Preferences → Add-ons → Install → 选择 ZIP
 2. 启用 **AI Texture to PBR**
-3. 如果面板提示基础组件缺失，点击 **一键修复基础组件**，完成后重新启用插件或重启 Blender
-4. 在 Preferences 中配置 API Provider（OpenAI / ModelScope / Gemini / 自定义兼容端点）
-5. 点击面板上的 **Generate PBR Maps**
+3. 如果 N-Panel 提示基础组件缺失，点击 **一键修复基础组件**；如果偏好设置里提示"未安装 keyring"，点击 **一键修复 API 组件**
+4. 修复完成后，重新启用插件或重启 Blender（一键修复成功后会尝试立即加载，如 UI 未刷新则重启）
+5. 在 Preferences 中配置 API Provider（OpenAI / ModelScope / Gemini / 自定义兼容端点）
+6. 点击面板上的 **Generate PBR Maps**
 
 ### 方式二：使用本地 ComfyUI
 
 1. 安装插件同上
 2. 在 3D View 右侧 N-Panel → **AI Texture** 面板，Provider 选择 **Local ComfyUI**
-3. 点击 **Install ComfyUI** 自动下载安装（约需 15-30 分钟，取决于网络）
-4. 在 Preferences → Model Manager 中下载所需模型
-5. 返回面板，选择材质配置，点击 **Generate PBR Maps**
+3. 点击 **获取 ComfyUI** 打开官方下载页面，下载并解压到本地；或点击 **测试连接** 自动检测/启动已配置路径的 ComfyUI
+4. 若缺少 `websocket-client` 等 ComfyUI 增强组件，点击 **一键修复 ComfyUI 组件**
+5. 在 Preferences → Model Manager 中下载所需模型
+6. 返回面板，选择材质配置，点击 **Generate PBR Maps**
 
 ### 使用参考图
 
@@ -80,16 +82,25 @@
 
 点击每个 Provider 的 **Fetch Models** 按钮自动拉取可用模型列表。
 
+### API Key 安全存储
+
+- 推荐安装 `keyring`（通过偏好设置里的 **一键修复 API 组件**）。安装后，API Key 会写入系统密钥环，Blender 偏好设置中仅显示占位符 `********`，不会随 `userpref.blend` 明文保存。
+- 未安装 `keyring` 时，API Key 仍以明文存储在 Blender 用户配置中，插件会显示红色警告提醒。
+
 ## 组件与一键修复
 
-插件会尽量使用 Blender 自带能力和 Python 标准库运行。`Pillow`、`requests`、
-`websocket-client` 属于增强组件：
+插件会尽量使用 Blender 自带能力和 Python 标准库运行。增强组件按需安装：
 
-- `Pillow`：剪贴板与图片解码增强；缺失时部分路径会回退到 Blender 主线程解码
-- `requests`：HTTP 兼容性增强；缺失时 API/ComfyUI 会尝试使用标准库 fallback
-- `websocket-client`：ComfyUI 实时进度；缺失时回退到 HTTP polling
+| 组件 | 用途 | 修复入口 |
+|------|------|----------|
+| `numpy` | 本地 PBR 算法必需 | **一键修复基础组件** |
+| `Pillow` | 剪贴板、图片解码增强 | **一键修复 API 组件** / **一键修复 ComfyUI 组件** |
+| `requests` | HTTP 客户端增强 | **一键修复 API 组件** / **一键修复 ComfyUI 组件** |
+| `keyring` | API Key 安全存储 | **一键修复 API 组件** |
+| `websocket-client` | ComfyUI 实时进度 | **一键修复 ComfyUI 组件** |
+| `py7zr` | ComfyUI 便携版 7z 解压 | **一键修复安装器组件** |
 
-本地 PBR 需要 `numpy`。如果 Blender 环境缺少基础组件，面板会显示 **一键修复基础组件**。
+缺失时插件不会自动安装，只在对应面板显示 **一键修复...** 按钮，由用户手动触发，避免注册阶段阻塞或 headless 环境报错。
 
 ## 快捷键
 
@@ -114,6 +125,9 @@
 - 尝试调整重绘幅度（参考图模式）
 - 优化 Prompt（使用 AI 优化按钮，或手动编写更详细的描述）
 - 切换后端（不同后端效果有差异）
+
+### API Key 输入后星号变短？
+这是正常现象。安装 `keyring` 后，插件会把真实密钥写入系统密钥环，Blender 输入框里只保留 8 位占位符 `********`，不会暴露真实密钥长度，也不影响实际生成。
 
 ## 许可证
 
