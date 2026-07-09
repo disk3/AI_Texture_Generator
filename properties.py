@@ -4,6 +4,7 @@ from .preferences import (
     get_api_text_model_items,
     get_texture_provider_items,
 )
+from .sd_backend.workflow_specs import get_family_spec, WORKFLOW_FAMILIES
 from .utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -469,23 +470,59 @@ def _update_texture_prompt(self, context):
     self.prompt = build_texture_prompt(self)
 
 
-def _get_local_comfyui_model_items(self, context):
-    """从偏好设置缓存的本地 ComfyUI 模型列表生成枚举项。
+# 当前在 LOCAL_COMFYUI 面板中启用的模型族
+_LOCAL_COMFYUI_FAMILY_ITEMS = [
+    ("zimage", "Z-Image / Lumina2", ""),
+]
 
-    列出 diffusion_models / unet 目录下的模型，用于替换工作流中的生图主模型。
-    """
-    items = [('DEFAULT', "使用工作流默认", "")]
+
+def _get_local_comfyui_family_items(self, context):
+    """LOCAL_COMFYUI 模型族下拉项。"""
+    return list(_LOCAL_COMFYUI_FAMILY_ITEMS)
+
+
+def _get_selected_family(self) -> str:
+    return getattr(self, "local_comfyui_family", "zimage") or "zimage"
+
+
+def _get_local_model_items_for_role(self, context, role: str):
+    """按当前模型族和角色（主模型/VAE/文本编码器/辅助模型）过滤本地模型。"""
+    family_id = _get_selected_family(self)
+    family = get_family_spec(family_id)
+    allowed_kinds = set(family.get("model_kind_filter", ("unet", "diffusion_models")))
+
+    if role == "vae":
+        allowed_kinds = {"vae"}
+
+    items = [("DEFAULT", "使用工作流默认", "")]
     try:
         addon_pkg = __package__.split('.')[0]
         prefs = context.preferences.addons[addon_pkg].preferences
         for model in prefs.comfyui_models:
-            if model.model_kind in ("unet", "diffusion_models") and model.model_id:
-                items.append((model.model_id, model.label or model.model_id, ""))
+            if not model.model_id or model.model_family != family_id:
+                continue
+            if model.model_kind not in allowed_kinds:
+                continue
+            items.append((model.model_id, model.label or model.model_id, ""))
     except Exception:
         pass
     if len(items) == 1:
-        items.append(('__EMPTY__', "（请先刷新本地模型列表）", ""))
+        items.append(("__EMPTY__", "（请先刷新本地模型列表）", ""))
     return items
+
+
+def _get_local_comfyui_model_items(self, context):
+    return _get_local_model_items_for_role(self, context, "main_model")
+
+
+def _get_local_comfyui_vae_items(self, context):
+    return _get_local_model_items_for_role(self, context, "vae")
+
+
+def _on_local_comfyui_family_changed(self, context):
+    """切换模型族时清空已选的具体模型，避免跨族残留。"""
+    self.local_comfyui_model = "DEFAULT"
+    self.local_comfyui_vae = "DEFAULT"
 
 
 # =============================================================================
@@ -612,11 +649,23 @@ class CTProperties(bpy.types.PropertyGroup):
         items=get_api_text_model_items,
     )
 
-    # 本地 ComfyUI 工作流模型选择（由偏好设置"刷新本地模型列表"填充）
+    # 本地 ComfyUI 模型族与模型选择
+    local_comfyui_family: bpy.props.EnumProperty(
+        name="模型族",
+        description="选择本地 ComfyUI 生图模型族",
+        items=_get_local_comfyui_family_items,
+        default=0,
+        update=_on_local_comfyui_family_changed,
+    )
     local_comfyui_model: bpy.props.EnumProperty(
         name="主模型",
-        description="选择 ComfyUI/models/unet 中已下载的文生图/图生图主模型（如 Z-Image Turbo）。'使用工作流默认' 表示不覆盖",
+        description="选择当前模型族的主模型。'使用工作流默认' 表示不覆盖",
         items=_get_local_comfyui_model_items,
+    )
+    local_comfyui_vae: bpy.props.EnumProperty(
+        name="VAE",
+        description="选择当前模型族对应的 VAE。'使用工作流默认' 表示不覆盖",
+        items=_get_local_comfyui_vae_items,
     )
 
     # PBR 提取参数已删除：默认始终使用 CHORD，Blender 算法仅作为 CHORD 失败时的 fallback。

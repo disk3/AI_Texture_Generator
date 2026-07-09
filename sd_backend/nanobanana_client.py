@@ -2,6 +2,8 @@
 
 支持 Gemini 2.0 Flash 图像生成（generateContent API）。
 文档: https://ai.google.dev/gemini-api/docs
+
+旧版 NanoBanana /images/generations 接口已清理，现在只保留 Gemini 路径。
 """
 
 import base64
@@ -25,7 +27,7 @@ def _requests_module():
 
 
 class NanobananaClient(AbstractSDClient):
-    """Gemini API 客户端（兼容旧 NanoBanana 偏好设置）。"""
+    """Google Gemini API 客户端。"""
 
     def __init__(
         self,
@@ -42,9 +44,6 @@ class NanobananaClient(AbstractSDClient):
         self._health_cache = None
         self._health_cache_time = 0.0
 
-    def _is_gemini(self) -> bool:
-        return "googleapis.com" in self.base_url
-
     @staticmethod
     def _normalize_base_url(base_url: str) -> str:
         base = (base_url or "https://generativelanguage.googleapis.com/v1beta").rstrip("/")
@@ -60,21 +59,14 @@ class NanobananaClient(AbstractSDClient):
         if self._health_cache is not None and (now - self._health_cache_time) < 30:
             return self._health_cache
 
+        if not self.api_key:
+            self._health_cache = False
+            self._health_cache_time = now
+            return False
+
         try:
-            if self._is_gemini():
-                if not self.api_key:
-                    self._health_cache = False
-                    self._health_cache_time = now
-                    return False
-                url = f"{self.base_url}/models?key={self.api_key}"
-                resp = requests.get(url, timeout=10)
-                result = resp.status_code == 200
-                self._health_cache = result
-                self._health_cache_time = now
-                return result
-            # 非 Gemini URL 的 fallback（占位）
-            headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
-            resp = requests.get(f"{self.base_url}/models", headers=headers, timeout=10)
+            url = f"{self.base_url}/models?key={self.api_key}"
+            resp = requests.get(url, timeout=10)
             result = resp.status_code == 200
             self._health_cache = result
             self._health_cache_time = now
@@ -103,9 +95,7 @@ class NanobananaClient(AbstractSDClient):
                 "Gemini API Key 未配置，请在偏好设置中填写 API Key。"
             )
 
-        if self._is_gemini():
-            return self._generate_gemini(config)
-        return self._generate_legacy(config)
+        return self._generate_gemini(config)
 
     def _generate_gemini(self, config: GenerationConfig) -> GenerationResult:
         """调用 Gemini generateContent API 生成图像（含 429 重试）。
@@ -222,53 +212,3 @@ class NanobananaClient(AbstractSDClient):
             },
         )
 
-    def _generate_legacy(self, config: GenerationConfig) -> GenerationResult:
-        """旧版占位逻辑（非 Gemini URL 时保留）。"""
-        requests = _requests_module()
-
-        url = f"{self.base_url}/images/generations"
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-        prompt = with_reference_mode_hint(config.prompt, config)
-
-        payload = {
-            "prompt": prompt,
-            "width": config.width,
-            "height": config.height,
-            "n": config.batch_size,
-        }
-
-        if self._progress_cb:
-            self._progress_cb(0.3, "正在发送请求...")
-
-        resp = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
-        resp.raise_for_status()
-        data = resp.json()
-
-        if self._progress_cb:
-            self._progress_cb(0.8, "正在下载结果...")
-
-        from ..utils.image_utils import load_image_bytes_to_numpy
-
-        images = []
-        for item in data.get("images", []):
-            img_url = item.get("url") or item.get("image_url")
-            if img_url:
-                img_resp = requests.get(img_url, timeout=30)
-                img_resp.raise_for_status()
-                images.append(load_image_bytes_to_numpy(img_resp.content))
-
-        if not images:
-            raise RuntimeError("API 未返回任何图像。")
-
-        if self._progress_cb:
-            self._progress_cb(1.0, "完成")
-
-        return GenerationResult(
-            images=images,
-            seed=-1,
-            info={},
-            metadata={"backend": "nanobanana", "timestamp": time.time()},
-        )

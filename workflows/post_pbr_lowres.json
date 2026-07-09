@@ -1,0 +1,103 @@
+{
+  "10": {
+    "inputs": {
+      "images": [
+        "9",
+        0
+      ],
+      "filename_prefix": "texture_image"
+    },
+    "class_type": "SaveImage"
+  },
+  "11": {
+    "inputs": {
+      "image": [
+        "9",
+        0
+      ],
+      "target_width": 1024,
+      "target_height": 1024,
+      "padding_color": "white",
+      "interpolation": "lanczos"
+    },
+    "class_type": "ResizeAndPadImage"
+  },
+  "12": {
+    "inputs": {
+      "ckpt_name": "chord_v1.safetensors"
+    },
+    "class_type": "ChordLoadModel"
+  },
+  "14": {
+    "inputs": {
+      "images": [
+        "20",
+        0
+      ],
+      "filename_prefix": "basecolor"
+    },
+    "class_type": "SaveImage"
+  },
+  "15": {
+    "inputs": {
+      "images": [
+        "20",
+        1
+      ],
+      "filename_prefix": "normal"
+    },
+    "class_type": "SaveImage"
+  },
+  "16": {
+    "inputs": {
+      "images": [
+        "20",
+        3
+      ],
+      "filename_prefix": "metalness"
+    },
+    "class_type": "SaveImage"
+  },
+  "17": {
+    "inputs": {
+      "images": [
+        "20",
+        2
+      ],
+      "filename_prefix": "roughness"
+    },
+    "class_type": "SaveImage"
+  },
+  "18": {
+    "inputs": {
+      "normal": [
+        "20",
+        1
+      ]
+    },
+    "class_type": "ChordNormalToHeight"
+  },
+  "19": {
+    "inputs": {
+      "images": [
+        "18",
+        0
+      ],
+      "filename_prefix": "height"
+    },
+    "class_type": "SaveImage"
+  },
+  "20": {
+    "inputs": {
+      "chord_model": [
+        "12",
+        0
+      ],
+      "image": [
+        "11",
+        0
+      ]
+    },
+    "class_type": "ChordMaterialEstimation"
+  }
+}

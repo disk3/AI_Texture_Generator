@@ -1,0 +1,199 @@
+{
+  "11": {
+    "inputs": {
+      "image": [
+        "9",
+        0
+      ],
+      "target_width": 1024,
+      "target_height": 1024,
+      "padding_color": "white",
+      "interpolation": "lanczos"
+    },
+    "class_type": "ResizeAndPadImage"
+  },
+  "12": {
+    "inputs": {
+      "ckpt_name": "chord_v1.safetensors"
+    },
+    "class_type": "ChordLoadModel"
+  },
+  "18": {
+    "inputs": {
+      "normal": [
+        "20",
+        1
+      ]
+    },
+    "class_type": "ChordNormalToHeight"
+  },
+  "20": {
+    "inputs": {
+      "chord_model": [
+        "12",
+        0
+      ],
+      "image": [
+        "11",
+        0
+      ]
+    },
+    "class_type": "ChordMaterialEstimation"
+  },
+  "72": {
+    "inputs": {
+      "model": "ema_vae_fp16.safetensors",
+      "device": "cuda:0",
+      "encode_tiled": true,
+      "encode_tile_size": 1024,
+      "encode_tile_overlap": 128,
+      "decode_tiled": true,
+      "decode_tile_size": 1024,
+      "decode_tile_overlap": 128,
+      "tile_debug": "false",
+      "offload_device": "cpu"
+    },
+    "class_type": "SeedVR2LoadVAEModel"
+  },
+  "73": {
+    "inputs": {
+      "model": "seedvr2_ema_3b_fp16.safetensors",
+      "device": "cuda:0",
+      "blocks_to_swap": 32,
+      "swap_io_components": true,
+      "offload_device": "cpu",
+      "attention_mode": "sdpa"
+    },
+    "class_type": "SeedVR2LoadDiTModel"
+  },
+  "110": {
+    "inputs": {
+      "image": [
+        "20",
+        0
+      ],
+      "upscale_method": "lanczos",
+      "scale_by": 0.5000000000000001
+    },
+    "class_type": "ImageScaleBy"
+  },
+  "111": {
+    "inputs": {
+      "image": [
+        "110",
+        0
+      ],
+      "dit": [
+        "73",
+        0
+      ],
+      "vae": [
+        "72",
+        0
+      ],
+      "seed": 2716928955,
+      "resolution": 2048,
+      "max_resolution": 4096,
+      "batch_size": 1,
+      "uniform_batch_size": false,
+      "color_correction": "lab",
+      "temporal_overlap": 0,
+      "prepend_frames": 0,
+      "input_noise_scale": 0,
+      "latent_noise_scale": 0,
+      "offload_device": "cpu",
+      "enable_debug": false
+    },
+    "class_type": "SeedVR2VideoUpscaler"
+  },
+  "112": {
+    "inputs": {
+      "images": [
+        "111",
+        0
+      ],
+      "filename_prefix": "basecolor"
+    },
+    "class_type": "SaveImage"
+  },
+  "120": {
+    "inputs": {
+      "image": [
+        "20",
+        1
+      ],
+      "upscale_method": "lanczos",
+      "scale_by": 0.5000000000000001
+    },
+    "class_type": "ImageScaleBy"
+  },
+  "121": {
+    "inputs": {
+      "image": [
+        "120",
+        0
+      ],
+      "dit": [
+        "73",
+        0
+      ],
+      "vae": [
+        "72",
+        0
+      ],
+      "seed": 2716928955,
+      "resolution": 2048,
+      "max_resolution": 4096,
+      "batch_size": 1,
+      "uniform_batch_size": false,
+      "color_correction": "lab",
+      "temporal_overlap": 0,
+      "prepend_frames": 0,
+      "input_noise_scale": 0,
+      "latent_noise_scale": 0,
+      "offload_device": "cpu",
+      "enable_debug": false
+    },
+    "class_type": "SeedVR2VideoUpscaler"
+  },
+  "122": {
+    "inputs": {
+      "images": [
+        "121",
+        0
+      ],
+      "filename_prefix": "normal"
+    },
+    "class_type": "SaveImage"
+  },
+  "130": {
+    "inputs": {
+      "images": [
+        "20",
+        2
+      ],
+      "filename_prefix": "roughness"
+    },
+    "class_type": "SaveImage"
+  },
+  "140": {
+    "inputs": {
+      "images": [
+        "20",
+        3
+      ],
+      "filename_prefix": "metalness"
+    },
+    "class_type": "SaveImage"
+  },
+  "150": {
+    "inputs": {
+      "images": [
+        "18",
+        0
+      ],
+      "filename_prefix": "height"
+    },
+    "class_type": "SaveImage"
+  }
+}

@@ -30,6 +30,7 @@ from ..material.local_pbr_processor import (
 from ..properties import _build_preservation_prompt
 from ..preferences import get_selected_api_provider_snapshot, resolve_asset_output_path
 from ..sd_backend import comfyui_installer
+from ..sd_backend import workflow_specs as _wf_specs
 from ..sd_backend.comfyui_client import ComfyUIClient
 from ..sd_backend.comfyui_env_resolver import inject_comfyui_packages
 
@@ -63,6 +64,35 @@ def _sanitize_filename(name: str, max_len: int = 64) -> str:
     return name
 
 
+_MAP_TYPE_SUFFIX = {
+    'diffuse': 'D',
+    'normal': 'N',
+    'roughness': 'RGH',
+    'metallic': 'M',
+    'height': 'H',
+    'packed': 'Mask',
+}
+
+
+def _build_material_name(data: dict, max_len: int = 48) -> str:
+    """根据材质配置组合出一个英文材质名称。
+
+    使用分类/子分类/颜色/特征/表面处理的英文代码拼接；
+    没有可用配置时回退到对象名。
+    """
+    codes = [
+        data.get("texture_category", ""),
+        data.get("texture_subcategory", ""),
+        data.get("texture_color", ""),
+        data.get("texture_feature", ""),
+        data.get("texture_finish", ""),
+    ]
+    parts = [c for c in codes if c and c != "Nil"]
+    if parts:
+        return _sanitize_filename("_".join(parts), max_len)
+    return _sanitize_filename(data.get("active_object_name", "Material"), max_len)
+
+
 class GenerationOrchestrator:
     def __init__(self):
         self._pool = ConnectionPool()
@@ -75,6 +105,9 @@ class GenerationOrchestrator:
     @staticmethod
     def _check_client_health(client, backend_type: str, auto_launch_path: str = "") -> bool:
         if backend_type == 'COMFYUI':
+            # 桌面版需要用户手动启动 Desktop 应用，插件不应尝试直接启动实例
+            if auto_launch_path and comfyui_installer.get_comfyui_type(auto_launch_path) == "desktop":
+                return client.check_health()
             return client.check_health(auto_launch_path=auto_launch_path)
         return client.check_health()
 
@@ -117,7 +150,7 @@ class GenerationOrchestrator:
                 use_local_pbr = getattr(props, "use_local_pbr", False)
                 if not (has_reference and not has_prompt and use_local_pbr):
                     props.is_generating = False
-                    bpy.ops.ai_concept.install_comfyui('INVOKE_DEFAULT')
+                    bpy.ops.ai_concept.get_comfyui('INVOKE_DEFAULT')
                     return
 
         # ---- 主线程中安全执行所有 bpy 操作 ----
@@ -258,7 +291,7 @@ class GenerationOrchestrator:
         if not asset_output_path:
             thread_safe_callback({
                 "status": "error",
-                "message": "请先在偏好设置 > 输出中设置资源输出目录",
+                "message": "请设置贴图保存目录",
             })
             props.is_generating = False
             return
@@ -292,6 +325,9 @@ class GenerationOrchestrator:
             "active_object_name": obj.name,
             "generation_id": generation_id,
             "texture_category": props.texture_category,
+            "texture_subcategory": getattr(props, "texture_subcategory", ""),
+            "texture_color": getattr(props, "texture_color", ""),
+            "texture_feature": getattr(props, "texture_feature", ""),
             "texture_finish": props.texture_finish,
             "texture_generator": texture_generator,
             "has_user_prompt": has_user_prompt,
@@ -308,6 +344,8 @@ class GenerationOrchestrator:
         data["normal_detail"] = getattr(props, "normal_detail", 0.4)
         data["normal_invert"] = getattr(props, "normal_invert", False)
         data["local_comfyui_model"] = getattr(props, "local_comfyui_model", "DEFAULT")
+        data["local_comfyui_family"] = getattr(props, "local_comfyui_family", "zimage")
+        data["local_comfyui_vae"] = getattr(props, "local_comfyui_vae", "")
         if reference_numpy is not None:
             data["reference_numpy"] = reference_numpy
 
@@ -446,26 +484,56 @@ class GenerationOrchestrator:
         )
 
     @staticmethod
-    def _postprocess_comfyui_seams(textures: dict) -> dict:
+    def _is_already_seamless(image: np.ndarray) -> bool:
+        """判断图片是否已经满足基本无缝要求（避免对已接近无缝的输出二次破坏）。"""
+        if image is None:
+            return False
+        metrics = compute_seam_metrics(image, map_type="diffuse")
+        return metrics.get("ok", False)
+
+    @staticmethod
+    def _postprocess_comfyui_seams(textures: dict, method: str = "SMART") -> dict:
         """对 ComfyUI/CHORD 返回的完整贴图集做本地无缝修复。
 
         对每个 PBR 通道分别调用本地无缝化算法；normal 使用向量域归一化。
+        当前统一使用 PPS，不偏移、不裁剪原图，避免 PBR 通道间错位。
         """
+        from ..utils.async_bridge import thread_safe_callback
+
         supported = {'diffuse', 'normal', 'roughness', 'metallic', 'height', 'ao'}
         processed = {}
-        for map_type, img in textures.items():
+        map_list = list(textures.items())
+        print(f"[AI Texture] _postprocess_comfyui_seams: start maps={[k for k, _ in map_list]} method={method}")
+        for idx, (map_type, img) in enumerate(map_list):
             if map_type not in supported or img is None:
                 processed[map_type] = img
                 continue
-            out = make_seamless_tile_local(
-                img,
-                method="SMART",
-                overlap=0.12,
-                is_normal=(map_type == "normal"),
-            )
-            if map_type == 'normal' and out.shape[-1] == 3:
+            thread_safe_callback({
+                "status": "progress",
+                "progress": 0.52 + 0.28 * (idx / max(len(map_list), 1)),
+                "message": f"正在对 {map_type} 贴图做无缝处理...",
+            })
+            print(f"[AI Texture] _postprocess_comfyui_seams: processing {map_type} shape={getattr(img, 'shape', 'n/a')}")
+            # normal 需要避免空间偏移：PPS/PRESERVE 不偏移原图，可直接复用；
+            # SMART/ADVANCED/BASIC 等会偏移/裁剪，用法线向量域 BASIC 混合。
+            if map_type == "normal" and method not in {"PPS", "PRESERVE"}:
+                out = make_seamless_tile_local(
+                    img,
+                    method=method,
+                    overlap=0.12,
+                    is_normal=True,
+                )
+            else:
+                out = make_seamless_tile_local(
+                    img,
+                    method=method,
+                    overlap=0.12,
+                    is_normal=False,
+                )
+            if map_type == 'normal':
                 out = renormalize_normal_map(out)
             processed[map_type] = out
+        print("[AI Texture] _postprocess_comfyui_seams: done")
         return processed
 
     def _process_reference(self, data, use_chord: bool = True):
@@ -529,23 +597,38 @@ class GenerationOrchestrator:
         """
         target_w = data["config"].width
         target_h = data["config"].height
-        if diffuse.shape[:2] != (target_h, target_w):
-            diffuse = resize_numpy_image(diffuse, target_w, target_h)
+
+        using_local_pbr = data.get("use_local_pbr", False) or not self._is_comfyui_installed_for_data(data)
+        effective_use_chord = self._should_use_chord(data, use_chord)
+        family_id = data.get("local_comfyui_family", "zimage") or "zimage"
+        seamless_method = _wf_specs.get_family_seamless_method(family_id)
+        print(f"[AI Texture] _extract_pbr: start using_local_pbr={using_local_pbr}, effective_use_chord={effective_use_chord}, target={target_w}x{target_h}, family={family_id}, seamless={seamless_method}")
+
+        # CHORD 内部固定 1024 推理：高分辨率时没必要先放大到目标尺寸再喂给 CHORD
+        if effective_use_chord and max(target_w, target_h) > 1024:
+            chord_input_w, chord_input_h = 1024, 1024
+        else:
+            chord_input_w, chord_input_h = target_w, target_h
+
+        if effective_use_chord:
+            if diffuse.shape[:2] != (chord_input_h, chord_input_w):
+                diffuse = resize_numpy_image(diffuse, chord_input_w, chord_input_h)
+        else:
+            if diffuse.shape[:2] != (target_h, target_w):
+                diffuse = resize_numpy_image(diffuse, target_w, target_h)
 
         if self._is_cancelled(data):
             thread_safe_callback({"status": "cancelled"})
             return
 
-        using_local_pbr = data.get("use_local_pbr", False) or not self._is_comfyui_installed_for_data(data)
-        if using_local_pbr and not already_seamless:
-            diffuse = self._make_seamless_tile(diffuse)
+        if using_local_pbr and not already_seamless and not self._is_already_seamless(diffuse):
+            diffuse = self._make_seamless_tile(diffuse, method=seamless_method)
 
         textures = existing_textures.copy() if existing_textures else {}
         textures['diffuse'] = diffuse
 
-        effective_use_chord = self._should_use_chord(data, use_chord)
-
         if effective_use_chord:
+            print(f"[AI Texture] Extract PBR: CHORD-only workflow ({chord_input_w}x{chord_input_h}) -> output {target_w}x{target_h}")
             chord_success = False
             try:
                 comfyui_path = data.get("comfyui_path", "") or comfyui_installer.get_default_install_path()
@@ -560,7 +643,12 @@ class GenerationOrchestrator:
                         log.debug("ComfyUI package injection failed: %s", e)
 
                 cclient = ComfyUIClient(base_url=url)
-                if cclient.check_health(auto_launch_path=auto_launch_path):
+                # 桌面版不自动启动
+                if comfyui_installer.get_comfyui_type(auto_launch_path) == "desktop":
+                    health_ok = cclient.check_health()
+                else:
+                    health_ok = cclient.check_health(auto_launch_path=auto_launch_path)
+                if health_ok:
                     thread_safe_callback({
                         "status": "progress",
                         "progress": 0.4,
@@ -569,8 +657,8 @@ class GenerationOrchestrator:
                     # CHORD 工作流现在支持 numpy 数组作为输入
                     chord_result = cclient.execute_chord_workflow(
                         diffuse,
-                        width=target_w,
-                        height=target_h,
+                        width=chord_input_w,
+                        height=chord_input_h,
                     )
                     pbr_maps = chord_result.pbr_maps
                     if pbr_maps:
@@ -604,7 +692,12 @@ class GenerationOrchestrator:
                     "progress": 0.4,
                     "message": "CHORD 失败，回退到本地算法提取...",
                 })
+                # 回退到本地算法时需要目标尺寸的 diffuse
+                if diffuse.shape[:2] != (target_h, target_w):
+                    diffuse = resize_numpy_image(diffuse, target_w, target_h)
+                    textures['diffuse'] = diffuse
         else:
+            print(f"[AI Texture] Extract PBR: local algorithm ({target_w}x{target_h})")
             thread_safe_callback({
                 "status": "progress",
                 "progress": 0.4,
@@ -687,7 +780,10 @@ class GenerationOrchestrator:
                 })
         elif not already_seamless:
             # LOCAL_COMFYUI / API 非本地 PBR 模式：CHORD 完成后统一在 Blender 里做无缝
-            textures = self._postprocess_comfyui_seams(textures)
+            if self._is_already_seamless(textures.get('diffuse')):
+                print("[AI Texture] _extract_pbr: diffuse already seamless, skip postprocess")
+            else:
+                textures = self._postprocess_comfyui_seams(textures, method=seamless_method)
 
         textures_for_import = {k: v.copy() for k, v in textures.items()}
         thread_safe_callback({
@@ -695,7 +791,64 @@ class GenerationOrchestrator:
             "progress": 0.9,
             "message": "正在应用 PBR 材质...",
         })
-        run_on_main_thread(lambda: self._import_texture_results(data, textures_for_import), timeout=300.0)
+        print("[AI Texture] _extract_pbr: calling run_on_main_thread(_import_texture_results)")
+        run_on_main_thread(lambda: self._import_texture_results(data, textures_for_import), timeout=60.0)
+        print("[AI Texture] _extract_pbr: run_on_main_thread returned")
+
+    def _process_comfy_pbr_result(self, data, result):
+        """解析 ComfyUI 返回的 PBR 贴图，补齐缺失通道，并按统一方式做无缝修复。"""
+        def _pil_to_np(img):
+            if isinstance(img, np.ndarray):
+                return img
+            return np.array(img)
+
+        pbr_maps = result.pbr_maps
+        log.debug("result.pbr_maps keys: %s", list(pbr_maps.keys()) if pbr_maps else [])
+        if not pbr_maps:
+            outputs = result.metadata.get("outputs", []) if result.metadata else []
+            log.debug("No named PBR maps. ComfyUI outputs: %s", outputs)
+            if result.images:
+                pbr_maps = {"diffuse": result.images[0]}
+                thread_safe_callback({
+                    "status": "progress",
+                    "progress": 0.45,
+                    "message": "无法识别 CHORD 贴图命名，将使用返回图像并提取 PBR 贴图。",
+                })
+            else:
+                raise RuntimeError(
+                    "ComfyUI workflow returned no usable images. "
+                    "Open the latest ComfyUI history entry and check whether SaveImage nodes for basecolor/normal/roughness/metalness/height executed."
+                )
+
+        textures = {}
+        if "basecolor" in pbr_maps:
+            textures['diffuse'] = _pil_to_np(pbr_maps["basecolor"])
+        elif "diffuse" in pbr_maps:
+            textures['diffuse'] = _pil_to_np(pbr_maps["diffuse"])
+        if "normal" in pbr_maps:
+            textures['normal'] = _pil_to_np(pbr_maps["normal"])
+        if "roughness" in pbr_maps:
+            textures['roughness'] = _pil_to_np(pbr_maps["roughness"])
+        if "height" in pbr_maps:
+            textures['height'] = _pil_to_np(pbr_maps["height"])
+        if "metalness" in pbr_maps:
+            textures['metallic'] = _pil_to_np(pbr_maps["metalness"])
+
+        if 'diffuse' not in textures and result.images:
+            textures['diffuse'] = _pil_to_np(result.images[0])
+
+        diffuse = textures.get('diffuse')
+        if diffuse is None:
+            raise RuntimeError("ComfyUI 工作流未返回 diffuse 贴图。")
+
+        chord_maps = [k for k in ['diffuse', 'normal', 'roughness', 'height', 'metallic'] if k in textures]
+        thread_safe_callback({
+            "status": "progress",
+            "progress": 0.5,
+            "message": f"贴图就绪: {', '.join(chord_maps)}",
+        })
+
+        self._extract_pbr(diffuse, data, use_chord=False, existing_textures=textures, already_seamless=False)
 
     def _generate_texture_worker(self, data, client):
         """后台线程生成 PBR 贴图：ComfyUI Zimage + CHORD 工作流提取 PBR。"""
@@ -733,11 +886,27 @@ class GenerationOrchestrator:
                 "message": "正在 ComfyUI 中运行 Zimage+CHORD 工作流...",
             })
 
-            # 注入用户选择的本地 ComfyUI 主模型（Z-Image Turbo / UNETLoader node 1）
+            # 注入用户选择的本地 ComfyUI 模型族与具体模型
+            family_id = data.get("local_comfyui_family", "zimage") or "zimage"
+            base_config.model_family = family_id
+
+            def _is_sentinel(value: str) -> bool:
+                return not value or value in ("DEFAULT", "__EMPTY__", "NONE")
+
+            selections = {}
             selected_model = data.get("local_comfyui_model", "DEFAULT")
-            if selected_model and selected_model not in ("DEFAULT", "__EMPTY__"):
-                base_config.model_overrides["1"] = {"unet_name": selected_model}
-                log.debug("Override main UNET model to %s", selected_model)
+            if not _is_sentinel(selected_model):
+                selections["main_model"] = selected_model
+                log.debug("Override main model to %s", selected_model)
+            if not _is_sentinel(data.get("local_comfyui_vae", "")):
+                selections["vae"] = data["local_comfyui_vae"]
+            base_config.model_selections = selections
+
+            max_target = max(int(base_config.width), int(base_config.height))
+            if max_target > 1024:
+                print(f"[AI Texture] Local ComfyUI >1024: CHORD-first + SeedVR2 ({base_config.width}x{base_config.height})")
+            else:
+                print(f"[AI Texture] Local ComfyUI <=1024: Z-Image + CHORD ({base_config.width}x{base_config.height})")
 
             result = client.execute_workflow_json(base_config)
             client.set_progress_callback(None)
@@ -745,73 +914,7 @@ class GenerationOrchestrator:
                 thread_safe_callback({"status": "cancelled"})
                 return
 
-            pbr_maps = result.pbr_maps
-            log.debug("result.pbr_maps keys: %s", list(pbr_maps.keys()))
-
-            if not pbr_maps:
-                outputs = result.metadata.get("outputs", []) if result.metadata else []
-                log.debug("No named PBR maps. ComfyUI outputs: %s", outputs)
-                if result.images:
-                    pbr_maps = {"diffuse": result.images[0]}
-                    thread_safe_callback({
-                        "status": "progress",
-                        "progress": 0.45,
-                        "message": "无法识别 CHORD 贴图命名，将使用返回图像并提取 PBR 贴图。",
-                    })
-                else:
-                    raise RuntimeError(
-                        "ComfyUI workflow returned no usable images. "
-                        "Open the latest ComfyUI history entry and check whether SaveImage nodes for basecolor/normal/roughness/metalness/height executed."
-                    )
-
-            def _pil_to_np(img):
-                """将 ComfyUI 返回的 PIL Image 转为 numpy uint8。"""
-                if isinstance(img, np.ndarray):
-                    return img
-                return np.array(img)
-
-            diffuse = None
-            textures = {}
-            if "basecolor" in pbr_maps:
-                textures['diffuse'] = _pil_to_np(pbr_maps["basecolor"])
-            elif "diffuse" in pbr_maps:
-                textures['diffuse'] = _pil_to_np(pbr_maps["diffuse"])
-            if "normal" in pbr_maps:
-                textures['normal'] = _pil_to_np(pbr_maps["normal"])
-            if "roughness" in pbr_maps:
-                textures['roughness'] = _pil_to_np(pbr_maps["roughness"])
-            if "height" in pbr_maps:
-                textures['height'] = _pil_to_np(pbr_maps["height"])
-            if "metalness" in pbr_maps:
-                textures['metallic'] = _pil_to_np(pbr_maps["metalness"])
-
-            if 'diffuse' not in textures and result.images:
-                textures['diffuse'] = _pil_to_np(result.images[0])
-
-            diffuse = textures.get('diffuse')
-            if diffuse is None:
-                raise RuntimeError("ComfyUI 工作流未返回 diffuse 贴图。")
-
-            chord_maps = [k for k in ['diffuse', 'normal', 'roughness', 'height', 'metallic'] if k in textures]
-            thread_safe_callback({
-                "status": "progress",
-                "progress": 0.5,
-                "message": f"贴图就绪: {', '.join(chord_maps)}",
-            })
-
-            # 如果 CHORD 没返回完整 PBR，用算法补齐
-            if 'normal' not in textures or 'roughness' not in textures or 'metallic' not in textures:
-                self._extract_pbr(diffuse, data, use_chord=False, existing_textures=textures)
-            else:
-                # CHORD 完成后统一在 Blender 里做无缝修复
-                textures = self._postprocess_comfyui_seams(textures)
-                textures_for_import = {k: v.copy() for k, v in textures.items()}
-                thread_safe_callback({
-                    "status": "progress",
-                    "progress": 0.9,
-                    "message": "正在应用 PBR 材质...",
-                })
-                run_on_main_thread(lambda: self._import_texture_results(data, textures_for_import), timeout=300.0)
+            self._process_comfy_pbr_result(data, result)
 
         except Exception as e:
             thread_safe_callback({
@@ -865,7 +968,9 @@ class GenerationOrchestrator:
                 item_data["batch_total"] = len(result.images)
                 if not isinstance(diffuse, np.ndarray):
                     diffuse = np.array(diffuse)
-                self._extract_pbr(diffuse, item_data, use_chord=self._is_comfyui_installed_for_data(data))
+
+                print(f"[AI Texture] API image {idx + 1}/{len(result.images)}: CHORD + unified seamless")
+                self._extract_pbr(diffuse, item_data, use_chord=self._is_comfyui_installed_for_data(item_data))
 
         except Exception as e:
             thread_safe_callback({
@@ -875,6 +980,7 @@ class GenerationOrchestrator:
 
     def _import_texture_results(self, data, textures=None):
         """在主线程中创建 Blender Image 和 PBR 材质。"""
+        print("[AI Texture] _import_texture_results: start")
         try:
             if self._is_cancelled(data):
                 thread_safe_callback({"status": "cancelled"})
@@ -938,21 +1044,32 @@ class GenerationOrchestrator:
                     textures[k] = resize_numpy_image(textures[k], target_w, target_h)
 
             output_dir = data.get("asset_output_path", "")
-            if not output_dir or not os.path.isdir(output_dir):
+            if not output_dir:
                 thread_safe_callback({
                     "status": "error",
-                    "message": "资源输出目录无效，请在偏好设置 > 输出中设置有效的目录",
+                    "message": "资源输出目录未设置，请在偏好设置 > 输出中设置有效的目录",
+                })
+                return
+            try:
+                os.makedirs(output_dir, exist_ok=True)
+            except Exception as e:
+                thread_safe_callback({
+                    "status": "error",
+                    "message": f"无法创建资源输出目录 {output_dir}: {e}",
                 })
                 return
 
+            print(f"[AI Texture] _import_texture_results: output_dir={output_dir}, maps={list(textures.keys())}, size={target_w}x{target_h}")
             images = {}
             batch_id = time.strftime("%Y%m%d_%H%M%S")
             if data.get("batch_total", 1) > 1:
                 batch_id = f"{batch_id}_b{int(data.get('batch_index', 0)) + 1:02d}"
-            safe_obj_name = _sanitize_filename(obj.name)
+            material_name = _build_material_name(data)
 
             for map_type, np_img in textures.items():
-                img_name = f"{safe_obj_name}_{map_type}_{batch_id}"
+                suffix = _MAP_TYPE_SUFFIX.get(map_type, map_type.upper()[:3])
+                img_name = f"{material_name}_{suffix}_{batch_id}"
+                print(f"[AI Texture] _import_texture_results: creating Blender image {img_name} shape={np_img.shape}")
 
                 # 统一转换为 RGBA uint8
                 if np_img.ndim == 2:
@@ -979,8 +1096,9 @@ class GenerationOrchestrator:
 
                 images[map_type] = blender_img
 
+            print(f"[AI Texture] _import_texture_results: building material with {len(images)} images")
             mat = ShaderBuilder.build_principled_bsdf(
-                f"Mat_{safe_obj_name}_PBR",
+                f"Mat_{material_name}_PBR",
                 images,
                 output_config=output_config,
             )
@@ -992,7 +1110,7 @@ class GenerationOrchestrator:
 
             # 记录到结果列表
             item = props.results.add()
-            item.name = f"PBR {safe_obj_name} ({batch_id})"
+            item.name = f"PBR {material_name} ({batch_id})"
             item.result_type = 'pbr'
             item.timestamp = batch_id
 
@@ -1006,6 +1124,7 @@ class GenerationOrchestrator:
 
             props.active_result_index = len(props.results) - 1
 
+            print(f"[AI Texture] _import_texture_results: applied material to {obj.name}")
             thread_safe_callback({
                 "status": "progress",
                 "progress": 1.0,

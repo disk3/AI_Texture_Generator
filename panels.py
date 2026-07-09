@@ -82,9 +82,12 @@ def _draw_generation_backend(box, props, prefs):
     box.label(text=status_text, icon=status_icon)
 
     if provider == 'LOCAL_COMFYUI':
+        box.prop(props, "local_comfyui_family", text="模型族")
         row = box.row(align=True)
         row.prop(props, "local_comfyui_model", text="主模型")
         row.operator("ai_concept.refresh_comfyui_models", text="", icon='FILE_REFRESH')
+        # Z-Image 允许换 VAE（虽然通常固定为 ae.sft）
+        box.prop(props, "local_comfyui_vae", text="VAE")
 
     if preferences.is_api_provider_value(provider):
         _draw_api_model_selector(box, props, prefs, provider)

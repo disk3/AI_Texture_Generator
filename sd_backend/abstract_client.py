@@ -47,6 +47,9 @@ class GenerationConfig:
     use_chord_enhanced: bool = True
     # 本地 ComfyUI 工作流模型覆盖：{节点 ID: {输入字段: 值}}
     model_overrides: Dict[str, Dict] = field(default_factory=dict)
+    # 模型族 + 用户在该族下选择的具体模型文件
+    model_family: str = "zimage"
+    model_selections: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass

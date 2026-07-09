@@ -1230,19 +1230,22 @@ class AI_OT_EditPromptInTextEditor(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        # 只在 3D View 的 N-panel（UI region）中生效，避免在 viewport 主体里误触发
-        if context.area.type != 'VIEW_3D':
+        # 只在 3D View 中生效（无论焦点在 viewport 还是 N-panel）
+        if context.area is None or context.area.type != 'VIEW_3D':
             return False
-        if context.region.type != 'UI':
-            return False
-        # 避免在已拆出的文本编辑器里重复触发；若记录的区域已被手动关闭则清理状态
-        props = context.scene.ai_concept_props
-        if props.prompt_editor_new_area_ptr:
-            for area in context.screen.areas:
-                if str(area.as_pointer()) == props.prompt_editor_new_area_ptr:
-                    return False
-            props.prompt_editor_new_area_ptr = ""
         return True
+
+    def _find_existing_editor_area(self, context):
+        props = context.scene.ai_concept_props
+        ptr = props.prompt_editor_new_area_ptr
+        if not ptr:
+            return None
+        for area in context.screen.areas:
+            if str(area.as_pointer()) == ptr:
+                return area
+        # 记录的区域已被关闭，清理状态
+        props.prompt_editor_new_area_ptr = ""
+        return None
 
     def execute(self, context):
         props = context.scene.ai_concept_props
@@ -1256,6 +1259,18 @@ class AI_OT_EditPromptInTextEditor(bpy.types.Operator):
 
         # 将当前 prompt 写入文本块
         text.from_string(props.prompt)
+
+        # 如果编辑器已经存在，仅刷新内容并聚焦，不再拆分
+        existing_area = self._find_existing_editor_area(context)
+        if existing_area is not None:
+            existing_area.type = 'TEXT_EDITOR'
+            for space in existing_area.spaces:
+                if space.type == 'TEXT_EDITOR':
+                    space.text = text
+                    space.show_line_numbers = True
+                    space.show_word_wrap = True
+                    break
+            return {'FINISHED'}
 
         # 记录拆分前所有 area 的指针
         existing_pointers = {str(a.as_pointer()) for a in context.screen.areas}
@@ -1318,7 +1333,7 @@ class AI_OT_ApplyPromptFromTextEditor(bpy.types.Operator):
     @classmethod
     def poll(cls, context):
         # 只有在 Prompt 编辑器实际存在且当前焦点在文本编辑器时才触发
-        if context.area.type != 'TEXT_EDITOR':
+        if context.area is None or context.area.type != 'TEXT_EDITOR':
             return False
         props = context.scene.ai_concept_props
         if not props.prompt_editor_new_area_ptr:
@@ -1419,14 +1434,10 @@ class AI_MT_ReferenceImageMenu(bpy.types.Menu):
 
 
 # =============================================================================
-# ComfyUI 安装 / 模型下载
+# ComfyUI 获取 / 模型下载页
 # =============================================================================
 
-_install_state = {
-    "thread": None,
-    "status": "",
-    "running": False,
-}
+COMFYUI_DOWNLOAD_URL = "https://comfy.org/zh-CN/download"
 
 
 def _get_prefs(context):
@@ -1438,149 +1449,16 @@ def _get_install_path(prefs):
     return prefs.comfyui_path or comfyui_installer.get_default_install_path()
 
 
-def _poll_install():
-    """轮询后台安装线程并更新 UI 状态。"""
-    state = _install_state
-    if state["thread"] is None:
-        return None
-    if state["thread"].is_alive():
-        try:
-            if bpy.context and bpy.context.scene:
-                bpy.context.scene.ai_concept_props.status_message = f"正在安装 ComfyUI: {state['status']}"
-                log.debug("ComfyUI install: %s", state['status'])
-        except Exception:
-            log.debug("Could not update install status (context unavailable)")
-        return 0.5
-    state["running"] = False
-    try:
-        if bpy.context and bpy.context.scene:
-            bpy.context.scene.ai_concept_props.status_message = f"安装完成: {state['status']}"
-            log.debug("ComfyUI install finished: %s", state['status'])
-    except Exception:
-        log.debug("Could not update install finished status (context unavailable)")
-    for window in bpy.context.window_manager.windows:
-        for area in window.screen.areas:
-            area.tag_redraw()
-    state["thread"] = None
-    return None
-
-
-class AI_OT_InstallComfyUI(bpy.types.Operator):
-    bl_idname = "ai_concept.install_comfyui"
-    bl_label = "安装 ComfyUI"
-    bl_description = "下载并安装 ComfyUI 本体和必需节点；模型需在模型管理器中单独下载"
+class AI_OT_GetComfyUI(bpy.types.Operator):
+    bl_idname = "ai_concept.get_comfyui"
+    bl_label = "获取 ComfyUI"
+    bl_description = "打开 ComfyUI 官方下载页面，按指引下载安装"
     bl_options = {'REGISTER'}
 
-    install_path: bpy.props.StringProperty(
-        name="安装目录",
-        description="ComfyUI 将被下载并安装到此目录",
-        subtype='DIR_PATH',
-        default="",
-    )
-
-    def invoke(self, context, event):
-        prefs = _get_prefs(context)
-        self.install_path = prefs.comfyui_path or comfyui_installer.get_default_install_path()
-        return context.window_manager.invoke_props_dialog(self, width=480)
-
-    def draw(self, context):
-        layout = self.layout
-        col = layout.column(align=True)
-        col.label(text="即将下载并安装 ComfyUI 及必需节点。", icon='INFO')
-        col.separator()
-        col.label(text=f"⚠ 预计需要约 18 GB 可用磁盘空间；模型需额外空间", icon='ERROR')
-        col.label(text="⚠ 需要 NVIDIA GPU (4 GB+ 显存) 才能正常使用", icon='ERROR')
-        col.label(text="⚠ 下载可能需要 15~60 分钟（取决于网络）", icon='ERROR')
-        col.separator()
-        col.prop(self, "install_path")
-        col.separator()
-        col.label(text="仅需执行一次，安装完成后即可使用本地 ComfyUI。")
-        col.separator()
-        col.label(text="确认继续？")
-
     def execute(self, context):
-        if os.name != "nt":
-            self.report({'ERROR'}, "ComfyUI 自动安装仅支持 Windows。请在 macOS/Linux 上手动安装 ComfyUI 并在偏好设置中设置路径。")
-            return {'CANCELLED'}
-
-        state = _install_state
-        if state["running"]:
-            self.report({'WARNING'}, "安装已在进行中")
-            return {'CANCELLED'}
-
-        prefs = _get_prefs(context)
-        target = self.install_path or _get_install_path(prefs)
-        if self.install_path:
-            prefs.comfyui_path = self.install_path
-
-        state["running"] = True
-        state["status"] = "准备中..."
-
-        def progress_cb(phase, progress, message):
-            state["status"] = message
-            log.debug("Install [%s]: %s", phase, message)
-
-        use_mirror = getattr(prefs, "use_china_mirror", True)
-
-        def worker():
-            try:
-                comfyui_installer.install_comfyui(target, progress_cb, use_mirror=use_mirror)
-            except Exception as e:
-                state["status"] = f"Error: {e}"
-            finally:
-                state["running"] = False
-
-        state["thread"] = threading.Thread(target=worker, daemon=True)
-        state["thread"].start()
-
-        bpy.app.timers.register(_poll_install, first_interval=0.5)
-        self.report({'INFO'}, "ComfyUI 后台安装已启动")
-        return {'FINISHED'}
-
-
-class AI_OT_DownloadModel(bpy.types.Operator):
-    bl_idname = "ai_concept.download_model"
-    bl_label = "下载模型"
-    bl_description = "下载选中的模型到 ComfyUI models 目录"
-    bl_options = {'REGISTER'}
-
-    model_id: bpy.props.StringProperty()
-
-    def execute(self, context):
-        prefs = _get_prefs(context)
-        comfyui_path = _get_install_path(prefs)
-
-        if not os.path.isdir(comfyui_path):
-            self.report({'ERROR'}, "ComfyUI 路径不存在")
-            return {'CANCELLED'}
-
-        model_id = self.model_id
-
-        if not pref_utils.start_download_state(model_id):
-            self.report({'WARNING'}, "该模型正在下载中")
-            return {'CANCELLED'}
-
-        hf_token = prefs.huggingface_token
-        use_mirror = getattr(prefs, "use_china_mirror", True)
-
-        def progress_cb(phase, progress, message):
-            pref_utils.update_download_state(model_id, progress, message)
-            log.debug("Download [%s] %s: %s", model_id, phase, message)
-
-        def worker():
-            try:
-                comfyui_installer.download_model(
-                    comfyui_path, model_id, progress_cb,
-                    hf_token=hf_token, use_mirror=use_mirror,
-                )
-                pref_utils.finish_download_state(model_id, "完成")
-            except Exception as e:
-                log.exception("Model download failed: %s", model_id)
-                pref_utils.finish_download_state(model_id, f"错误: {e}")
-
-        threading.Thread(target=worker, daemon=True).start()
-        pref_utils.ensure_download_poll_timer()
-        self.report({'INFO'}, f"开始下载模型: {model_id}")
+        import webbrowser
+        webbrowser.open(COMFYUI_DOWNLOAD_URL)
+        self.report({'INFO'}, "已在浏览器打开 ComfyUI 下载页面")
         return {'FINISHED'}
 
 
@@ -1598,58 +1476,41 @@ class AI_OT_OpenModelDownloadPage(bpy.types.Operator):
             self.report({'ERROR'}, "未知模型")
             return {'CANCELLED'}
 
-        prefs = _get_prefs(context)
-        use_mirror = getattr(prefs, "use_china_mirror", True)
-
-        page = model.get("page") or ""
-        if not use_mirror:
-            # 关闭镜像时尝试打开官方 HuggingFace 页面
-            official_url = ""
-            for u in [model.get("url", "")] + list(model.get("mirrors", [])):
-                if "huggingface.co" in u:
-                    official_url = u
-                    break
-            if official_url:
-                # 从 resolve URL 推导文件树页面
-                import re
-                page = re.sub(r"/resolve/main/[^/]+$", "/tree/main", official_url)
-                if "/tree/main" not in page:
-                    page = official_url.rsplit("/", 1)[0] + "/tree/main"
-
+        page = model.get("page") or model.get("url", "")
         if not page:
-            page = model.get("url")
-        if not page:
-            self.report({'ERROR'}, "无可用的下载页面")
+            self.report({'ERROR'}, "该模型没有下载链接")
             return {'CANCELLED'}
+
+        import webbrowser
         webbrowser.open(page)
         return {'FINISHED'}
 
 
-addon_keymaps = []
-
+# Operator registration
 classes = [
     AI_OT_GenerateTexture,
     AI_OT_StopGeneration,
     AI_OT_LoadReferenceImage,
     AI_OT_PasteReferenceImage,
+    AI_OT_OptimizePrompt,
+    AI_OT_OpenImageFolder,
+    AI_OT_EnlargePreview,
+    AI_OT_ChannelPackRebuild,
+    AI_OT_ClearResults,
+    AI_OT_RemoveResult,
+    AI_OT_PrevResult,
+    AI_OT_NextResult,
     AI_OT_ClearReferenceImage,
     AI_OT_CaptionReferenceImage,
     AI_OT_EditPromptInTextEditor,
     AI_OT_ApplyPromptFromTextEditor,
     AI_PT_PromptEditorPanel,
     AI_MT_ReferenceImageMenu,
-    AI_OT_ClearResults,
-    AI_OT_RemoveResult,
-    AI_OT_PrevResult,
-    AI_OT_NextResult,
-    AI_OT_OpenImageFolder,
-    AI_OT_EnlargePreview,
-    AI_OT_OptimizePrompt,
-    AI_OT_ChannelPackRebuild,
-    AI_OT_InstallComfyUI,
-    AI_OT_DownloadModel,
+    AI_OT_GetComfyUI,
     AI_OT_OpenModelDownloadPage,
 ]
+
+_addon_keymaps = []
 
 
 def register():
@@ -1662,70 +1523,80 @@ def register():
                 continue
             raise
 
-    # 注册菜单追加
-    bpy.types.TEXT_MT_text.append(_prompt_editor_menu_func)
+    # 注册快捷键（使用 Window 全局键位，operator poll 负责限制触发范围）
+    try:
+        wm = bpy.context.window_manager
+        kc = wm.keyconfigs.addon
+        if kc:
+            # 参考图面板 Ctrl+V 粘贴剪贴板图像
+            km = kc.keymaps.new(name='Window')
+            kmi = km.keymap_items.new(
+                "ai_concept.paste_reference_image",
+                type='V',
+                value='PRESS',
+                ctrl=True,
+            )
+            _addon_keymaps.append((km, kmi))
 
-    # 注册快捷键
-    wm = bpy.context.window_manager
-    kc = wm.keyconfigs.addon
-    if kc:
-        km = kc.keymaps.new(name='Window')
-        kmi = km.keymap_items.new(
-            idname="ai_concept.paste_reference_image",
-            type='V',
-            value='PRESS',
-            ctrl=True,
-            shift=False,
-            alt=False,
-        )
-        addon_keymaps.append((km, kmi))
+            # Ctrl+Enter（含小键盘 Enter）：在 3D View N-panel 打开 Prompt 文本编辑器
+            km_edit = kc.keymaps.new(name='Window')
+            kmi_edit = km_edit.keymap_items.new(
+                "ai_concept.edit_prompt_in_text_editor",
+                type='RET',
+                value='PRESS',
+                ctrl=True,
+            )
+            _addon_keymaps.append((km_edit, kmi_edit))
 
-        # Ctrl+Enter（含小键盘 Enter）：打开 Prompt 文本编辑器编辑模式
-        # 通过 Window 全局注册，但 operator poll 限制只在 3D View 的 N-panel 中生效
-        km_edit = kc.keymaps.new(name='Window')
-        kmi_edit = km_edit.keymap_items.new(
-            idname="ai_concept.edit_prompt_in_text_editor",
-            type='RET',
-            value='PRESS',
-            ctrl=True,
-        )
-        addon_keymaps.append((km_edit, kmi_edit))
+            km_edit_pad = kc.keymaps.new(name='Window')
+            kmi_edit_pad = km_edit_pad.keymap_items.new(
+                "ai_concept.edit_prompt_in_text_editor",
+                type='NUMPAD_ENTER',
+                value='PRESS',
+                ctrl=True,
+            )
+            _addon_keymaps.append((km_edit_pad, kmi_edit_pad))
 
-        km_edit_pad = kc.keymaps.new(name='Window')
-        kmi_edit_pad = km_edit_pad.keymap_items.new(
-            idname="ai_concept.edit_prompt_in_text_editor",
-            type='NUMPAD_ENTER',
-            value='PRESS',
-            ctrl=True,
-        )
-        addon_keymaps.append((km_edit_pad, kmi_edit_pad))
+            # Ctrl+Enter（含小键盘 Enter）在文本编辑器中触发“接受提示词”
+            km_accept = kc.keymaps.new(name='Text', space_type='TEXT_EDITOR')
+            kmi_accept = km_accept.keymap_items.new(
+                "ai_concept.apply_prompt_from_text_editor",
+                type='RET',
+                value='PRESS',
+                ctrl=True,
+            )
+            _addon_keymaps.append((km_accept, kmi_accept))
 
-        # Ctrl+Enter（含小键盘 Enter）在文本编辑器中触发 Accept
-        km_accept = kc.keymaps.new(name='Text', space_type='TEXT_EDITOR')
-        kmi_accept = km_accept.keymap_items.new(
-            idname="ai_concept.apply_prompt_from_text_editor",
-            type='RET',
-            value='PRESS',
-            ctrl=True,
-        )
-        addon_keymaps.append((km_accept, kmi_accept))
+            km_accept_pad = kc.keymaps.new(name='Text', space_type='TEXT_EDITOR')
+            kmi_accept_pad = km_accept_pad.keymap_items.new(
+                "ai_concept.apply_prompt_from_text_editor",
+                type='NUMPAD_ENTER',
+                value='PRESS',
+                ctrl=True,
+            )
+            _addon_keymaps.append((km_accept_pad, kmi_accept_pad))
+    except Exception as e:
+        log.debug("Could not register keymaps: %s", e)
 
-        km_accept_pad = kc.keymaps.new(name='Text', space_type='TEXT_EDITOR')
-        kmi_accept_pad = km_accept_pad.keymap_items.new(
-            idname="ai_concept.apply_prompt_from_text_editor",
-            type='NUMPAD_ENTER',
-            value='PRESS',
-            ctrl=True,
-        )
-        addon_keymaps.append((km_accept_pad, kmi_accept_pad))
+    # 在 Text Editor 的 Text 菜单追加“接受提示词”项
+    try:
+        bpy.types.TEXT_MT_text.append(_prompt_editor_menu_func)
+    except Exception as e:
+        log.debug("Could not register prompt editor menu: %s", e)
 
 
 def unregister():
-    bpy.types.TEXT_MT_text.remove(_prompt_editor_menu_func)
+    for km, kmi in _addon_keymaps:
+        try:
+            km.keymap_items.remove(kmi)
+        except Exception:
+            pass
+    _addon_keymaps.clear()
 
-    for km, kmi in addon_keymaps:
-        km.keymap_items.remove(kmi)
-    addon_keymaps.clear()
+    try:
+        bpy.types.TEXT_MT_text.remove(_prompt_editor_menu_func)
+    except Exception:
+        pass
 
     for cls in reversed(classes):
         try:

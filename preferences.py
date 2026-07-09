@@ -3,110 +3,12 @@ import time
 import os
 import sys
 import importlib
-import threading
-from typing import Dict, Optional
 
 from .sd_backend import comfyui_installer
+from .ui import icons as icon_manager
 from .utils.logger import get_logger
 
 log = get_logger(__name__)
-
-# =============================================================================
-# 模型下载实时进度状态
-# =============================================================================
-_download_states: Dict[str, Dict] = {}
-_download_lock = threading.Lock()
-
-
-def start_download_state(model_id: str) -> bool:
-    """开始跟踪一个模型的下载状态。若该模型已在下载中则返回 False。"""
-    with _download_lock:
-        state = _download_states.get(model_id)
-        if state and not state.get("done"):
-            return False
-        _download_states[model_id] = {
-            "progress": 0.0,
-            "status": "准备中",
-            "done": False,
-        }
-        return True
-
-
-def update_download_state(model_id: str, progress: float, status: str):
-    with _download_lock:
-        state = _download_states.get(model_id)
-        if state:
-            state["progress"] = float(progress)
-            state["status"] = str(status)
-
-
-def finish_download_state(model_id: str, status: str = "完成"):
-    with _download_lock:
-        state = _download_states.get(model_id)
-        if state:
-            state["done"] = True
-            state["progress"] = 1.0
-            state["status"] = str(status)
-            state["finished_at"] = time.time()
-
-
-def get_download_state(model_id: str) -> Optional[Dict]:
-    with _download_lock:
-        state = _download_states.get(model_id)
-        return state.copy() if state else None
-
-
-def cleanup_download_states():
-    """清理已完成超过 2 秒的下载状态。"""
-    with _download_lock:
-        now = time.time()
-        to_remove = [
-            mid for mid, s in _download_states.items()
-            if s.get("done") and now - s.get("finished_at", now) > 2.0
-        ]
-        for mid in to_remove:
-            del _download_states[mid]
-
-
-def redraw_preference_areas():
-    """标记所有偏好设置面板区域需要重绘。"""
-    try:
-        for window in bpy.context.window_manager.windows:
-            for area in window.screen.areas:
-                if area.type == 'PREFERENCES':
-                    area.tag_redraw()
-    except Exception:
-        pass
-
-
-def poll_download_states():
-    """由 bpy.app.timers 调用，刷新下载进度 UI。"""
-    cleanup_download_states()
-    active = [s for s in _download_states.values() if not s.get("done")]
-    if active:
-        try:
-            if bpy.context and bpy.context.scene:
-                bpy.context.scene.ai_concept_props.status_message = f"正在下载模型: {active[0]['status']}"
-        except Exception:
-            pass
-        redraw_preference_areas()
-        return 0.5
-    try:
-        if bpy.context and bpy.context.scene:
-            bpy.context.scene.ai_concept_props.status_message = "模型下载完成"
-    except Exception:
-        pass
-    redraw_preference_areas()
-    return None
-
-
-def ensure_download_poll_timer():
-    """注册进度轮询 timer（若未注册）。"""
-    try:
-        if not bpy.app.timers.is_registered(poll_download_states):
-            bpy.app.timers.register(poll_download_states, first_interval=0.5)
-    except Exception as e:
-        log.debug("Could not register download poll timer: %s", e)
 
 API_PROVIDER_PREFIX = "API:"
 MAX_PANEL_IMAGE_MODELS = 8
@@ -133,7 +35,7 @@ DEPENDENCY_PROFILES = {
 def resolve_asset_output_path(prefs) -> str:
     """解析插件的资源输出路径为绝对路径。
 
-    返回空字符串表示用户尚未设置输出目录。
+    返回空字符串表示用户未设置输出目录。
     """
     asset_output_path = getattr(prefs, "asset_output_path", "")
     if asset_output_path.startswith("//"):
@@ -141,6 +43,23 @@ def resolve_asset_output_path(prefs) -> str:
     if not asset_output_path:
         return ""
     return os.path.abspath(asset_output_path)
+
+
+def get_default_asset_output_path() -> str:
+    """首次安装时的默认资源输出目录：系统 Pictures 下的 AI_Texture_Generator 子目录。"""
+    return os.path.join(os.path.expanduser("~"), "Pictures", "AI_Texture_Generator")
+
+
+def ensure_default_asset_output_path(prefs) -> None:
+    """如果用户尚未设置资源输出目录，则填入系统 Pictures 默认路径并自动创建。"""
+    if not getattr(prefs, "asset_output_path", ""):
+        prefs.asset_output_path = get_default_asset_output_path()
+    default_path = get_default_asset_output_path()
+    if prefs.asset_output_path == default_path:
+        try:
+            os.makedirs(default_path, exist_ok=True)
+        except Exception:
+            pass
 
 
 class AIAPIModelItem(bpy.types.PropertyGroup):
@@ -163,6 +82,40 @@ class AIComfyUIModelItem(bpy.types.PropertyGroup):
     model_id: bpy.props.StringProperty(name="模型 ID")
     label: bpy.props.StringProperty(name="标签")
     model_kind: bpy.props.StringProperty(name="类型")
+    model_family: bpy.props.StringProperty(name="模型族")
+
+
+def _classify_local_model(filename: str, model_kind: str) -> str:
+    """根据内置注册表、文件名和文件夹判断模型属于哪个族。
+
+    返回空字符串表示未知/未分类。"""
+    lower = filename.lower()
+
+    # 1. 优先匹配内置下载注册表（包括 alt_filenames）
+    for entry in comfyui_installer.get_model_registry():
+        if entry.get("filename") == filename:
+            return entry.get("family", "")
+        for alt in entry.get("alt_filenames", []):
+            if alt == filename:
+                return entry.get("family", "")
+
+    # 2. 文件夹强提示
+    if model_kind == "vae":
+        return "vae"
+    if model_kind in ("clip", "text_encoders"):
+        return "text_encoder"
+
+    # 3. 文件名关键字启发式（仅对生图主模型类生效）
+    if any(k in lower for k in ("flux2", "flux.2", "flux_2")):
+        return "flux2"
+    if any(k in lower for k in ("flux1", "flux.1", "flux_1")):
+        return "flux1"
+    if any(k in lower for k in ("z_image", "zimage", "z-image", "lumina", "aura")):
+        return "zimage"
+    if "sdxl" in lower:
+        return "sdxl"
+
+    return ""
 
 
 class AIAPIProviderItem(bpy.types.PropertyGroup):
@@ -411,29 +364,69 @@ class AI_OT_TestProviderConnection(bpy.types.Operator):
                 install_path = prefs.comfyui_path or comfyui_installer.get_default_install_path()
                 ctype = comfyui_installer.get_comfyui_type(install_path)
 
-                # 本地已安装：尝试直接启动并验证连接
+                from .sd_backend.comfyui_client import ComfyUIClient
+                from .sd_backend import workflow_specs as _wf_specs
+                client = ComfyUIClient(base_url=url)
+
+                # 本地已安装：尝试连接；桌面版不自动启动，需要用户先打开 Desktop 应用
                 if ctype:
-                    from .sd_backend.comfyui_client import ComfyUIClient
-                    self.report({'INFO'}, f"正在测试 ComfyUI {ctype} 连接，必要时将自动启动...")
-                    client = ComfyUIClient(base_url=url)
-                    if client.check_health(auto_launch_path=install_path):
-                        self.report({'INFO'}, f"ComfyUI 连接正常 ({ctype}): {url}")
-                        return {'FINISHED'}
-                    self.report({'ERROR'}, f"ComfyUI {ctype} 启动或连接失败，请检查安装与日志: {install_path}")
+                    if ctype == "desktop":
+                        self.report({'INFO'}, f"正在测试 ComfyUI Desktop 连接 ({url})...")
+                        if not client.check_health():
+                            self.report(
+                                {'ERROR'},
+                                f"ComfyUI Desktop 未在 {url} 响应。请先启动 ComfyUI Desktop，"
+                                f"并确认偏好设置中的 URL 与其监听地址一致。",
+                            )
+                            return {'CANCELLED'}
+                    else:
+                        self.report({'INFO'}, f"正在测试 ComfyUI {ctype} 连接，必要时将自动启动...")
+                        if not client.check_health(auto_launch_path=install_path):
+                            self.report({'ERROR'}, f"ComfyUI {ctype} 启动或连接失败，请检查安装与日志: {install_path}")
+                            return {'CANCELLED'}
+                else:
+                    # 本地未安装时，探测 URL 是否已有运行实例
+                    try:
+                        resp = requests.get(f"{url}/system_stats", timeout=(3, 10))
+                        resp.raise_for_status()
+                    except requests.exceptions.ReadTimeout:
+                        self.report({'WARNING'}, f"{url} 已连接但响应读取超时，ComfyUI 可能正在初始化，请稍后再试")
+                        return {'CANCELLED'}
+                    except Exception as e:
+                        self.report({'ERROR'}, f"未检测到 ComfyUI 安装，且 {url} 无法连接: {e}")
+                        return {'CANCELLED'}
+
+                # 连接可达后，先按模型族所需的最低核心版本做快速判断
+                props = getattr(context.scene, "ai_concept_props", None)
+                family_id = getattr(props, "local_comfyui_family", "zimage") if props else "zimage"
+                core_version = client.get_comfyui_core_version()
+                min_version_str = _wf_specs.get_family_min_version(family_id)
+                if core_version and min_version_str:
+                    min_version = tuple(int(x) for x in min_version_str.split(".") if x.isdigit())
+                    if len(min_version) >= 2 and core_version < min_version:
+                        actual_str = ".".join(str(x) for x in core_version)
+                        self.report(
+                            {'ERROR'},
+                            f"当前 ComfyUI 核心版本为 {actual_str}，但模型族 '{family_id}' "
+                            f"需要核心版本 {min_version_str}+。\n"
+                            "请先升级 ComfyUI 核心；若使用 ComfyUI Desktop，"
+                            "请在应用内更新核心版本（应用版本号不等于核心版本）。",
+                        )
+                        return {'CANCELLED'}
+
+                # 校验当前模型族 workflow 所需节点完整性
+                missing = client.check_workflow_nodes(family_id=family_id)
+                if missing:
+                    lines = [f"{cls_type} ({hint})" if hint else cls_type for _nid, cls_type, hint in missing]
+                    self.report(
+                        {'ERROR'},
+                        f"ComfyUI 缺少当前模型族 ({family_id}) 所需节点:\n" + "\n".join(lines[:8]),
+                    )
                     return {'CANCELLED'}
 
-                # 本地未安装时，探测 URL 是否已有运行实例
-                try:
-                    resp = requests.get(f"{url}/system_stats", timeout=(3, 10))
-                    resp.raise_for_status()
-                    self.report({'INFO'}, f"ComfyUI 运行中: {url}")
-                    return {'FINISHED'}
-                except requests.exceptions.ReadTimeout:
-                    self.report({'WARNING'}, f"{url} 已连接但响应读取超时，ComfyUI 可能正在初始化，请稍后再试")
-                    return {'CANCELLED'}
-                except Exception as e:
-                    self.report({'ERROR'}, f"未检测到 ComfyUI 安装，且 {url} 无法连接: {e}")
-                    return {'CANCELLED'}
+                ver_str = ".".join(str(x) for x in core_version) if core_version else "未知"
+                self.report({'INFO'}, f"ComfyUI 连接正常 (核心版本 {ver_str}) 且节点完整 ({family_id}): {url}")
+                return {'FINISHED'}
 
             if is_api_provider_value(self.provider):
                 ensure_default_api_providers(prefs)
@@ -519,7 +512,7 @@ class AI_OT_FetchModels(bpy.types.Operator):
     # 模型名称关键词分类（参考 Infinite-Canvas）
     IMAGE_KEYWORDS = [
         "image", "dalle", "dall-e", "imagen", "flux", "stable", "sdxl",
-        "midjourney", "banana", "ideogram", "z-image", "qwen-image",
+        "midjourney", "banana", "z-image", "qwen-image",
         "klein", "seedream", "text-to-image", "gpt-image"
     ]
 
@@ -806,6 +799,7 @@ class AI_OT_RefreshComfyUIModels(bpy.types.Operator):
                 item.model_id = filename
                 item.label = filename
                 item.model_kind = subdir
+                item.model_family = _classify_local_model(filename, subdir)
                 total += 1
 
         self.report({'INFO'}, f"已扫描到 {total} 个本地模型")
@@ -880,19 +874,6 @@ class CTAddonPreferences(bpy.types.AddonPreferences):
         default="",
     )
 
-    huggingface_token: bpy.props.StringProperty(
-        name="HuggingFace Token",
-        description="可选。用于自动下载 gated 模型；留空则只能下载公开模型",
-        subtype='PASSWORD',
-        default="",
-    )
-
-    use_china_mirror: bpy.props.BoolProperty(
-        name="使用国内镜像下载",
-        description="优先使用 hf-mirror.com、GitHub 代理等国内可访问镜像。如果已在国外或已翻墙可关闭",
-        default=True,
-    )
-
     # OpenAI-compatible image APIs (旧版兼容字段)
     gpt_api_key: bpy.props.StringProperty(
         name="API Key（旧版）",
@@ -944,7 +925,7 @@ class CTAddonPreferences(bpy.types.AddonPreferences):
 
     asset_output_path: bpy.props.StringProperty(
         name="资源输出目录",
-        description="必填。所有生成的贴图将保存到此目录",
+        description="必填。所有生成的贴图将保存到此目录。首次安装默认填充为系统 Pictures 文件夹",
         subtype='DIR_PATH',
         default="",
     )
@@ -952,6 +933,7 @@ class CTAddonPreferences(bpy.types.AddonPreferences):
     def draw(self, context):
         layout = self.layout
         ensure_default_api_providers(self)
+        ensure_default_asset_output_path(self)
 
         install_path = self.comfyui_path or comfyui_installer.get_default_install_path()
         installed = comfyui_installer.is_comfyui_installed(install_path)
@@ -971,69 +953,49 @@ class CTAddonPreferences(bpy.types.AddonPreferences):
         box.prop(self, "comfyui_url")
         box.prop(self, "comfyui_path")
 
-        row = box.row()
+        row = box.row(align=True)
+        if not installed and not has_configured_comfyui_path:
+            row.operator("ai_concept.get_comfyui", text="获取 ComfyUI", icon='URL')
+        op = row.operator("ai_concept.test_provider_connection", text="测试连接", icon='CHECKMARK')
+        op.provider = 'COMFYUI'
+        if installed and has_configured_comfyui_path:
+            op2 = row.operator("ai_concept.repair_dependencies", text="一键修复环境依赖", icon='IMPORT')
+            op2.profile = 'COMFYUI'
+
+        status_row = box.row()
         if installed:
-            row.label(text=f"已检测到: {install_path}", icon='CHECKMARK')
+            status_row.label(text=f"已检测到: {install_path}", icon='CHECKMARK')
+        elif has_configured_comfyui_path:
+            status_row.label(text="未检测到 ComfyUI，请确认路径是否正确或 ComfyUI 是否已启动", icon='ERROR')
         else:
-            row.label(text="未检测到 ComfyUI", icon='ERROR')
-            row = box.row()
-            row.operator("ai_concept.install_comfyui", text="自动下载安装", icon='IMPORT')
+            status_row.label(text="未检测到 ComfyUI，请通过「获取 ComfyUI」下载并解压", icon='ERROR')
 
-        # 安装完成后即显示测试（允许使用默认路径）
-        if installed:
-            row = box.row(align=True)
-            op = row.operator("ai_concept.test_provider_connection", text="测试", icon='CHECKMARK')
-            op.provider = 'COMFYUI'
-            if has_configured_comfyui_path:
-                row = box.row(align=True)
-                op = row.operator("ai_concept.repair_dependencies", text="一键修复环境依赖", icon='IMPORT')
-                op.profile = 'COMFYUI'
-
-        # Model Manager：仅在 ComfyUI 安装完成后显示
-        if installed:
-            model_box = layout.box()
-            model_box.label(text="模型管理", icon='PACKAGE')
-            model_box.prop(self, "use_china_mirror")
-            model_box.prop(self, "huggingface_token")
-            model_box.label(text="公开模型可直接下载；gated 模型需填 HuggingFace Token 或手动下载")
+        # 模型管理：只显示缺失的模型，已存在时不显示列表
+        model_box = layout.box()
+        model_box.label(text="模型管理", icon='PACKAGE')
+        missing_models = [
+            m for m in comfyui_installer.get_model_registry()
+            if comfyui_installer.find_model_file(install_path, m) is None
+        ]
+        if not missing_models:
             row = model_box.row(align=True)
-            row.operator("ai_concept.refresh_comfyui_models", text="刷新本地模型列表", icon='FILE_REFRESH')
-            row.label(text=f"已缓存 {len(self.comfyui_models)} 个模型", icon='INFO')
-            for model in comfyui_installer.get_model_registry():
-                actual_path = comfyui_installer.find_model_file(install_path, model)
-                is_installed = actual_path is not None
-                dl_state = get_download_state(model["id"])
-                downloading = dl_state is not None and not dl_state.get("done")
-                col = model_box.column(align=True)
-                row = col.row(align=True)
-                icon = 'CHECKMARK' if is_installed else 'CANCEL'
-                gated_text = " [gated]" if model.get("gated") else ""
-                row.label(text=f"{model['label']} ({model['size']}){gated_text}", icon=icon)
-                if not is_installed:
-                    if model.get("url"):
-                        if downloading:
-                            row.label(text="下载中...", icon='SORTTIME')
-                        else:
-                            op = row.operator("ai_concept.download_model", text="下载", icon='IMPORT')
-                            op.model_id = model["id"]
-                op2 = row.operator("ai_concept.open_model_download_page", text="网页", icon='URL')
-                op2.model_id = model["id"]
-                if downloading:
-                    prog_row = col.row(align=True)
-                    prog_row.scale_y = 0.8
-                    prog_row.progress(
-                        factor=dl_state["progress"],
-                        type='BAR',
-                        text=dl_state["status"],
-                    )
-                # 显示模型应存放路径或实际找到的路径
-                path_row = col.row()
-                path_row.scale_y = 0.8
-                if is_installed and actual_path:
-                    rel_path = os.path.relpath(actual_path, install_path).replace("\\", "/")
-                    path_row.label(text=f"  ✓ {rel_path}", icon='FILE_FOLDER')
+            row.label(text="所有必需模型已就绪", icon='CHECKMARK')
+        else:
+            model_box.label(text="请自行下载缺失模型并放到对应目录", icon='INFO')
+            row = model_box.row(align=True)
+            row.label(text="模型")
+            row.label(text="存放目录")
+            row.label(text="下载页")
+            for model in missing_models:
+                row = model_box.row(align=True)
+                row.label(text=f"{model['label']} ({model['size']})")
+                row.label(text=f"{model['dir']}/{model['filename']}")
+                icon_id = icon_manager.get_icon_id("download_arrow")
+                if icon_id:
+                    op = row.operator("ai_concept.open_model_download_page", text="", icon_value=icon_id)
                 else:
-                    path_row.label(text=f"  → {model['dir']}/{model['filename']}", icon='FILE_FOLDER')
+                    op = row.operator("ai_concept.open_model_download_page", text="", icon='DOWNARROW_HLT')
+                op.model_id = model["id"]
 
         api_box = layout.box()
         api_box.label(text="API 提供商", icon='URL')

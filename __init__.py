@@ -1,7 +1,7 @@
 bl_info = {
     "name": "AI 材质生成",
     "author": "Xiong Meng Han",
-    "version": (1, 1, 6),
+    "version": (1, 1, 8),
     "blender": (3, 6, 0),
     "location": "3D 视图 > 侧边栏 (N) > AI 材质",
     "description": "从提示词或参考图一键生成 PBR 材质贴图（支持本地 ComfyUI 与在线 API）",
@@ -345,30 +345,10 @@ def _auto_install_dependencies(missing: list, verifier=None) -> tuple[bool, str]
 
 def register():
     _inject_vendor_site()
-    # ── 基础依赖检查（本地 PBR 必需：numpy）──
-    # 不在启用插件时自动 pip install。美术用户通过 Preferences / 面板里的
-    # “一键修复”显式安装，避免插件启用阶段修改 Blender Python 环境。
-    missing = _check_runtime_dependencies()
-    runtime_ready = not missing
-    if missing:
-        log.warning("Missing runtime dependencies: %s", ", ".join(missing))
-        _show_dependency_warning(
-            missing,
-            "AI 材质生成插件缺少基础组件，请在插件设置中点击“一键修复”",
-        )
-
-    # 可选依赖缺失时仅警告，不阻止启用
-    try:
-        __import__("PIL")
-    except ImportError:
-        log.warning(
-            "Pillow 未安装，将使用 Blender/标准库降级图像解码；"
-            "剪贴板和部分图像格式兼容性会受限。本地 ComfyUI 用户可在对应设置中一键修复环境依赖。"
-        )
 
     from . import preferences, panels, properties
     from .utils import async_bridge
-    from .ui import preview_manager
+    from .ui import preview_manager, icons as icon_manager
 
     modules.clear()
     modules.extend([
@@ -377,29 +357,63 @@ def register():
         panels,
         async_bridge,
         preview_manager,
+        icon_manager,
     ])
 
+    # 先注册基础 UI 模块，确保偏好设置、一键修复按钮等已经可用
+    for mod in modules:
+        if hasattr(mod, "register"):
+            mod.register()
+
+    # ── 自动安装一键修复环境依赖（全部推荐组件）──
+    # 在基础模块注册完成后再执行，避免阻塞注册流程并确保弹窗/UI 可用。
+    runtime_ready = True
+    try:
+        from .preferences import dependency_missing_for_profile
+        missing = dependency_missing_for_profile('ALL')
+        if missing:
+            missing_display = [f"{import_name} ({desc})" for import_name, _pip_name, desc in missing]
+
+            def _verifier_all():
+                return [f"{i} ({d})" for i, _p, d in dependency_missing_for_profile('ALL')]
+
+            log.warning(
+                "Missing dependencies on startup, attempting auto-install: %s",
+                ", ".join(missing_display),
+            )
+            ok, msg = _auto_install_dependencies(missing_display, verifier=_verifier_all)
+            if ok:
+                log.info("Auto-installed dependencies: %s", msg)
+            else:
+                runtime_ready = False
+                log.warning("Auto-install dependencies failed: %s", msg)
+                _show_dependency_warning(
+                    missing_display,
+                    "AI 材质生成插件自动安装依赖失败，请手动安装或点击“一键修复环境依赖”",
+                )
+    except Exception as e:
+        log.warning("Could not check/auto-install dependencies: %s", e)
+
+    # 依赖就绪后再注册生成相关模块
     if runtime_ready:
-        from . import operators
-        from .core import orchestrator
-        modules.extend([
-            operators,
-            orchestrator,
-        ])
-    else:
-        log.warning("Generation operators were not registered because runtime dependencies are missing")
+        try:
+            from . import operators
+            from .core import orchestrator
+            operators.register()
+            orchestrator.register()
+            modules.extend([operators, orchestrator])
+        except Exception as e:
+            runtime_ready = False
+            log.warning("Generation operators were not registered: %s", e)
 
     # 后端模块（ComfyUI 客户端）可选加载
     if runtime_ready:
         try:
             from .sd_backend import comfyui_client
+            comfyui_client.register()
             modules.append(comfyui_client)
         except ImportError as e:
             log.warning("ComfyUI 客户端未能加载：%s", e)
-
-    for mod in modules:
-        if hasattr(mod, "register"):
-            mod.register()
 
     bpy.types.Scene.ai_concept_props = bpy.props.PointerProperty(
         type=properties.CTProperties
