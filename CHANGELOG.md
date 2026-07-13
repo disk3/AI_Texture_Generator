@@ -11,7 +11,7 @@ All notable changes to AI Texture to PBR will be documented in this file.
 ### Changed
 - 注册阶段不再自动安装缺失依赖，改为在 N-Panel / 偏好设置中提供 **一键修复基础组件 / API 组件 / ComfyUI 组件** 按钮，由用户手动触发，避免 headless/命令行环境崩溃或注册阶段长时间阻塞。
 - 偏好设置 API 提供商面板新增 **"一键修复 API 组件"** 按钮，用于安装 `Pillow`、`requests`、`keyring`。
-- AI 优化提示词、参考图反推、测试连接、获取模型列表等涉及网络请求的 Operator 改为后台线程 + modal 轮询，不再冻结 Blender UI。
+- AI 优化提示词、参考图反推、测试连接、获取模型列表等涉及网络请求的 Operator 恢复为同步阻塞执行，点击后 Blender UI 会等待请求完成。
 - WebSocket 连接超时缩短为 10 秒，recv 超时 1 秒，支持取消事件响应；修复进度计算 `max=0` 时的除零风险。
 - pip 安装策略调整：优先 PyPI 官方，其次阿里镜像，清华镜像作为 fallback（解决部分 wheel 403 问题）。
 - 大幅清理死代码与旧版兼容字段：删除 `material/pbr_generator.py`、`ui/progress_display.py`、`utils/math_utils.py`、旧版 API Key 字段、以及 `comfyui_installer.py` 中未使用的安装/模型下载函数。

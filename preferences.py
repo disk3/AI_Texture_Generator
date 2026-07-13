@@ -3,7 +3,6 @@ import time
 import os
 import sys
 import importlib
-import threading
 
 from .sd_backend import comfyui_installer
 from .ui import icons as icon_manager
@@ -486,29 +485,8 @@ class AI_OT_TestProviderConnection(bpy.types.Operator):
             self.report({'ERROR'}, f"未知的 Provider 类型: {self.provider}")
             return {'CANCELLED'}
 
-        self._result = {}
-        self._error = None
-        self._thread = threading.Thread(target=self._test_worker, args=(context,), daemon=True)
-        self._thread.start()
-        context.window_manager.modal_handler_add(self)
-        return {'RUNNING_MODAL'}
-
-    def modal(self, context, event):
-        if self._thread.is_alive():
-            return {'PASS_THROUGH'}
-        self._thread.join()
-        if self._error is not None:
-            self.report({'ERROR'}, str(self._error))
-            return {'CANCELLED'}
-        self.report({self._result["level"]}, self._result["message"])
-        return {self._result["status"]}
-
-    def _test_worker(self, context):
+        requests = _requests_module()
         try:
-            requests = _requests_module()
-            addon_pkg = __package__.split('.')[0]
-            prefs = context.preferences.addons[addon_pkg].preferences
-
             if self.provider == 'COMFYUI':
                 url = prefs.comfyui_url.rstrip("/")
                 install_path = prefs.comfyui_path or comfyui_installer.get_default_install_path()
@@ -521,38 +499,34 @@ class AI_OT_TestProviderConnection(bpy.types.Operator):
                 if ctype:
                     if ctype == "desktop":
                         if not client.check_health():
-                            self._result = {
-                                "status": "CANCELLED",
-                                "level": "ERROR",
-                                "message": f"ComfyUI Desktop 未在 {url} 响应。请先启动 ComfyUI Desktop，并确认偏好设置中的 URL 与其监听地址一致。",
-                            }
-                            return
+                            self.report(
+                                {'ERROR'},
+                                f"ComfyUI Desktop 未在 {url} 响应。请先启动 ComfyUI Desktop，并确认偏好设置中的 URL 与其监听地址一致。"
+                            )
+                            return {'CANCELLED'}
                     else:
                         if not client.check_health(auto_launch_path=install_path):
-                            self._result = {
-                                "status": "CANCELLED",
-                                "level": "ERROR",
-                                "message": f"ComfyUI {ctype} 启动或连接失败，请检查安装与日志: {install_path}",
-                            }
-                            return
+                            self.report(
+                                {'ERROR'},
+                                f"ComfyUI {ctype} 启动或连接失败，请检查安装与日志: {install_path}"
+                            )
+                            return {'CANCELLED'}
                 else:
                     try:
                         resp = requests.get(f"{url}/system_stats", timeout=(3, 10))
                         resp.raise_for_status()
                     except requests.exceptions.ReadTimeout:
-                        self._result = {
-                            "status": "CANCELLED",
-                            "level": "WARNING",
-                            "message": f"{url} 已连接但响应读取超时，ComfyUI 可能正在初始化，请稍后再试",
-                        }
-                        return
+                        self.report(
+                            {'WARNING'},
+                            f"{url} 已连接但响应读取超时，ComfyUI 可能正在初始化，请稍后再试"
+                        )
+                        return {'CANCELLED'}
                     except Exception as e:
-                        self._result = {
-                            "status": "CANCELLED",
-                            "level": "ERROR",
-                            "message": f"未检测到 ComfyUI 安装，且 {url} 无法连接: {e}",
-                        }
-                        return
+                        self.report(
+                            {'ERROR'},
+                            f"未检测到 ComfyUI 安装，且 {url} 无法连接: {e}"
+                        )
+                        return {'CANCELLED'}
 
                 props = getattr(context.scene, "ai_concept_props", None)
                 family_id = getattr(props, "local_comfyui_family", "zimage") if props else "zimage"
@@ -562,30 +536,27 @@ class AI_OT_TestProviderConnection(bpy.types.Operator):
                     min_version = tuple(int(x) for x in min_version_str.split(".") if x.isdigit())
                     if len(min_version) >= 2 and core_version < min_version:
                         actual_str = ".".join(str(x) for x in core_version)
-                        self._result = {
-                            "status": "CANCELLED",
-                            "level": "ERROR",
-                            "message": f"当前 ComfyUI 核心版本为 {actual_str}，但模型族 '{family_id}' 需要核心版本 {min_version_str}+。\n请先升级 ComfyUI 核心；若使用 ComfyUI Desktop，请在应用内更新核心版本（应用版本号不等于核心版本）。",
-                        }
-                        return
+                        self.report(
+                            {'ERROR'},
+                            f"当前 ComfyUI 核心版本为 {actual_str}，但模型族 '{family_id}' 需要核心版本 {min_version_str}+。\n请先升级 ComfyUI 核心；若使用 ComfyUI Desktop，请在应用内更新核心版本（应用版本号不等于核心版本）。"
+                        )
+                        return {'CANCELLED'}
 
                 missing = client.check_workflow_nodes(family_id=family_id)
                 if missing:
                     lines = [f"{cls_type} ({hint})" if hint else cls_type for _nid, cls_type, hint in missing]
-                    self._result = {
-                        "status": "CANCELLED",
-                        "level": "ERROR",
-                        "message": f"ComfyUI 缺少当前模型族 ({family_id}) 所需节点:\n" + "\n".join(lines[:8]),
-                    }
-                    return
+                    self.report(
+                        {'ERROR'},
+                        f"ComfyUI 缺少当前模型族 ({family_id}) 所需节点:\n" + "\n".join(lines[:8])
+                    )
+                    return {'CANCELLED'}
 
                 ver_str = ".".join(str(x) for x in core_version) if core_version else "未知"
-                self._result = {
-                    "status": "FINISHED",
-                    "level": "INFO",
-                    "message": f"ComfyUI 连接正常 (核心版本 {ver_str}) 且节点完整 ({family_id}): {url}",
-                }
-                return
+                self.report(
+                    {'INFO'},
+                    f"ComfyUI 连接正常 (核心版本 {ver_str}) 且节点完整 ({family_id}): {url}"
+                )
+                return {'FINISHED'}
 
             if is_api_provider_value(self.provider):
                 provider = find_api_provider(prefs, provider_id_from_value(self.provider))
@@ -602,26 +573,22 @@ class AI_OT_TestProviderConnection(bpy.types.Operator):
                         timeout=10,
                     )
                 if resp.status_code >= 400:
-                    self._result = {
-                        "status": "FINISHED",
-                        "level": "WARNING",
-                        "message": f"{provider.name} /models 返回 HTTP {resp.status_code}",
-                    }
-                    return
-                self._result = {
-                    "status": "FINISHED",
-                    "level": "INFO",
-                    "message": f"{provider.name} /models 响应正常。生成/对话端点可能需要配置正确的默认模型。",
-                }
-                return
+                    self.report(
+                        {'WARNING'},
+                        f"{provider.name} /models 返回 HTTP {resp.status_code}"
+                    )
+                else:
+                    self.report(
+                        {'INFO'},
+                        f"{provider.name} /models 响应正常。生成/对话端点可能需要配置正确的默认模型。"
+                    )
+                return {'FINISHED'}
 
-            self._result = {
-                "status": "CANCELLED",
-                "level": "ERROR",
-                "message": f"未知的 Provider 类型: {self.provider}",
-            }
+            self.report({'ERROR'}, f"未知的 Provider 类型: {self.provider}")
+            return {'CANCELLED'}
         except Exception as e:
-            self._error = f"连接测试失败: {e}"
+            self.report({'ERROR'}, f"连接测试失败: {e}")
+            return {'CANCELLED'}
 
 
 class AI_OT_AddAPIProvider(bpy.types.Operator):
@@ -901,44 +868,18 @@ class AI_OT_FetchModels(bpy.types.Operator):
             self.report({'ERROR'}, f"{provider.name} API Key 为空")
             return {'CANCELLED'}
 
-        self._result = None
-        self._error = None
-        self._thread = threading.Thread(target=self._fetch_worker, args=(provider,), daemon=True)
-        self._thread.start()
-        context.window_manager.modal_handler_add(self)
-        return {'RUNNING_MODAL'}
-
-    def modal(self, context, event):
-        if self._thread.is_alive():
-            return {'PASS_THROUGH'}
-        self._thread.join()
-
-        addon_pkg = __package__.split('.')[0]
-        prefs = context.preferences.addons[addon_pkg].preferences
-        provider = None
-        if self.provider_id:
-            provider = find_api_provider(prefs, self.provider_id)
-        elif 0 <= self.provider_index < len(prefs.api_providers):
-            provider = prefs.api_providers[self.provider_index]
-        elif 0 <= prefs.active_api_provider_index < len(prefs.api_providers):
-            provider = prefs.api_providers[prefs.active_api_provider_index]
-
-        if not provider:
-            self.report({'ERROR'}, "未找到 API Provider")
-            return {'CANCELLED'}
-
-        if self._error is not None:
+        try:
+            models, msg = self._handle_fetch(provider)
+        except Exception as e:
             if "modelscope" in provider.base_url.lower():
                 models = self.MODELSCOPE_DEFAULT_MODELS
-                msg = f"ModelScope 拉取失败 ({self._error})，已使用内置默认模型列表"
+                msg = f"ModelScope 拉取失败 ({e})，已使用内置默认模型列表"
             elif provider.protocol == 'GEMINI':
                 models = self.DEFAULT_GEMINI_MODELS
-                msg = f"Gemini 拉取失败 ({self._error})，已使用默认模型列表"
+                msg = f"Gemini 拉取失败 ({e})，已使用默认模型列表"
             else:
                 models = self.DEFAULT_OPENAI_MODELS
-                msg = f"{provider.name} 拉取失败 ({self._error})，已使用默认模型列表"
-        else:
-            models, msg = self._result
+                msg = f"{provider.name} 拉取失败 ({e})，已使用默认模型列表"
 
         provider.models.clear()
         vision_candidates = []
@@ -964,12 +905,6 @@ class AI_OT_FetchModels(bpy.types.Operator):
                 area.tag_redraw()
 
         return {'FINISHED'}
-
-    def _fetch_worker(self, provider):
-        try:
-            self._result = self._handle_fetch(provider)
-        except Exception as e:
-            self._error = str(e)
 
 
 class AI_OT_RefreshComfyUIModels(bpy.types.Operator):
